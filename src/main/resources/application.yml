@@ -1,0 +1,19 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: backend-rodo
+  config:
+    import: optional:file:.env[.properties],optional:file:../.env[.properties]
+  data:
+    mongodb:
+      uri: ${MONGODB_URI:mongodb://localhost:27017/rodo_express}
+      auto-index-creation: true
+
+app:
+  jwt:
+    secret: ${JWT_SECRET:rodo-express-hyperplane-secret-key-2026-ultra-secure-256bit}
+    expiration-hours: ${JWT_EXPIRATION_HOURS:24}
+  seed:
+    sample-data: ${SEED_SAMPLE_DATA:true}

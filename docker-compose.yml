@@ -1,0 +1,46 @@
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: rodo-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      TZ: America/Sao_Paulo
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - rodo-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend-rodo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: backend-rodo
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      TZ: America/Sao_Paulo
+      SERVER_PORT: 8080
+      MONGODB_URI: ${MONGODB_URI:-mongodb://mongodb:27017/rodo_express}
+      JWT_SECRET: ${JWT_SECRET:-rodo-express-hyperplane-secret-key-2026-ultra-secure-256bit}
+      JWT_EXPIRATION_HOURS: ${JWT_EXPIRATION_HOURS:-24}
+      SEED_SAMPLE_DATA: ${SEED_SAMPLE_DATA:-false}
+    networks:
+      - rodo-network
+
+volumes:
+  mongodb_data:
+
+networks:
+  rodo-network:
+    driver: bridge

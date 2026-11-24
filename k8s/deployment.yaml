@@ -1,0 +1,104 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rodo-express
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: backend-rodo-secrets
+  namespace: rodo-express
+type: Opaque
+stringData:
+  # Aponta para a instância do MongoDB na VPS (ex: docker-compose ou serviço local na porta 27017 da VPS)
+  MONGODB_URI: "${MONGODB_URI}"
+  JWT_SECRET: "${JWT_SECRET}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-rodo
+  namespace: rodo-express
+  labels:
+    app: backend-rodo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-rodo
+  template:
+    metadata:
+      labels:
+        app: backend-rodo
+    spec:
+      containers:
+        - name: backend-rodo
+          image: ${BACKEND_IMAGE}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: TZ
+              value: "America/Sao_Paulo"
+            - name: SERVER_PORT
+              value: "8080"
+            - name: SEED_SAMPLE_DATA
+              value: "false"
+            - name: MONGODB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: backend-rodo-secrets
+                  key: MONGODB_URI
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: backend-rodo-secrets
+                  key: JWT_SECRET
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1024Mi"
+---
+# Service LoadBalancer (K3s Klipper ServiceLB) + NodePort 30080
+# Expõe o backend diretamente para a internet na VPS (porta 8080 e NodePort 30080)
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-rodo-service
+  namespace: rodo-express
+  labels:
+    app: backend-rodo
+spec:
+  type: LoadBalancer
+  selector:
+    app: backend-rodo
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: 8080
+      nodePort: 30080
+---
+# Ingress Traefik nativo do K3s expondo /api para a internet na porta 80/443 da VPS
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: backend-rodo-ingress
+  namespace: rodo-express
+  annotations:
+    kubernetes.io/ingress.class: traefik
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend-rodo-service
+                port:
+                  number: 8080
