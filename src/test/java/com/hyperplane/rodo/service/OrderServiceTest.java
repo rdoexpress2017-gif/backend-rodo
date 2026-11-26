@@ -301,34 +301,44 @@ class OrderServiceTest {
                 .motoboyCommissionAmount(new BigDecimal("221.60"))
                 .status(OrderStatus.PAGO)
                 .build();
+        final Order o3 = Order.builder()
+                .id("o-3")
+                .amount(new BigDecimal("100.00"))
+                .motoboyCommissionAmount(new BigDecimal("80.00"))
+                .status(OrderStatus.PENDENTE)
+                .build();
 
-        when(mongoTemplate.find(any(Query.class), eq(Order.class))).thenReturn(Flux.just(o1, o2));
+        when(mongoTemplate.find(any(Query.class), eq(Order.class))).thenReturn(Flux.just(o1, o2, o3));
         when(expenseService.sumExpensesInPeriod(start, end)).thenReturn(Mono.just(new BigDecimal("15.40")));
 
         // Act
         final Mono<FinancialSummaryDTO> result = orderService.getFinancialSummary(start, end);
 
         // Assert:
-        // Valor Total de Pedidos (totalRevenue) = 500.00 + 277.00 = 777.00
+        // Valor Total de Pedidos (totalRevenue) = 500.00 + 277.00 + 100.00 = 877.00
         // Valor Já Recebido (paidRevenue - status PAGO) = 277.00
-        // Valor A Receber (pendingRevenue - status != PAGO) = 500.00
+        // Valor A Receber (pendingRevenue - status != PAGO) = 600.00
         // Repasses dos Pagos (paidCommissions) = 221.60
         // Despesas (Lançamentos) = 15.40
         // Quantidade Pagos (paidOrdersCount) = 1
-        // Quantidade A Receber (pendingOrdersCount) = 1
+        // Quantidade A Receber (pendingOrdersCount) = 2
         // Lucro (netBalance) = SOMENTE pedidos PAGOS: 277.00 - 221.60 - 15.40 = 40.00
+        // Lucro Estimado (estimatedProfit) = Pedidos do status COLETADO para frente (o1 ENTREGUE + o2 PAGO, excluindo o3 PENDENTE):
+        //   (500.00 + 277.00) - (400.00 + 221.60) - 15.40 = 777.00 - 621.60 - 15.40 = 140.00
         StepVerifier.create(result)
                 .expectNextMatches(summary ->
-                        summary.totalRevenue().compareTo(new BigDecimal("777.00")) == 0
+                        summary.totalRevenue().compareTo(new BigDecimal("877.00")) == 0
                                 && summary.paidRevenue().compareTo(new BigDecimal("277.00")) == 0
-                                && summary.pendingRevenue().compareTo(new BigDecimal("500.00")) == 0
-                                && summary.totalCommissions().compareTo(new BigDecimal("621.60")) == 0
+                                && summary.pendingRevenue().compareTo(new BigDecimal("600.00")) == 0
+                                && summary.totalCommissions().compareTo(new BigDecimal("701.60")) == 0
                                 && summary.paidCommissions().compareTo(new BigDecimal("221.60")) == 0
                                 && summary.totalExpenses().compareTo(new BigDecimal("15.40")) == 0
-                                && summary.totalOrders() == 2L
+                                && summary.totalOrders() == 3L
                                 && summary.paidOrdersCount() == 1L
-                                && summary.pendingOrdersCount() == 1L
+                                && summary.pendingOrdersCount() == 2L
                                 && summary.netBalance().compareTo(new BigDecimal("40.00")) == 0
+                                && summary.estimatedProfit() != null
+                                && summary.estimatedProfit().compareTo(new BigDecimal("140.00")) == 0
                 )
                 .verifyComplete();
     }

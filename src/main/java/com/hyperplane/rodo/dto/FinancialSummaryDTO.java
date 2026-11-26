@@ -14,5 +14,6 @@ public record FinancialSummaryDTO(
         BigDecimal pendingRevenue,
         BigDecimal paidCommissions,
         long paidOrdersCount,
-        long pendingOrdersCount
+        long pendingOrdersCount,
+        BigDecimal estimatedProfit
 ) {}

@@ -33,23 +33,19 @@ public class DailyBillingJob {
 
     @Scheduled(cron = "0 * * * * *", zone = "America/Sao_Paulo")
     public void checkAndExecuteAtConfiguredTime() {
-        final String currentHHmm = LocalTime.now(SAO_PAULO_ZONE).format(HH_MM_FMT);
         settingsService.getSettings()
-                .filter(settings -> {
-                    final String targetTime = (settings.dailyJobExecutionTime() != null
-                            && !settings.dailyJobExecutionTime().isBlank())
-                            ? settings.dailyJobExecutionTime().trim()
-                            : "20:00";
-                    return currentHHmm.equals(targetTime);
-                })
+                .filter(settings -> LocalTime.now(SAO_PAULO_ZONE).format(HH_MM_FMT).equals(
+                        (settings.dailyJobExecutionTime() != null && !settings.dailyJobExecutionTime().isBlank())
+                                ? settings.dailyJobExecutionTime().trim()
+                                : "20:00"
+                ))
                 .doOnNext(settings -> executeDailyClosing())
                 .subscribe();
     }
 
     public void executeDailyClosing() {
-        final LocalDate today = LocalDate.now(SAO_PAULO_ZONE);
-        log.info("Iniciando robô de fechamento diário no horário configurado para clientes, motoboys e empresa na data: {}", today);
-        reportService.processDailyBillingForDate(today)
+        reportService.processDailyBillingForDate(LocalDate.now(SAO_PAULO_ZONE))
+                .doOnSubscribe(sub -> log.info("Iniciando robô de fechamento diário no horário configurado para clientes, motoboys e empresa na data: {}", LocalDate.now(SAO_PAULO_ZONE)))
                 .doOnNext(report -> log.info("Fechamento gerado com sucesso: {} para entidade {}", report.reportCode(), report.targetEntityName()))
                 .doOnError(err -> log.error("Erro durante fechamento diário: {}", err.getMessage(), err))
                 .subscribe();

@@ -29,16 +29,13 @@ public class JwtTokenProvider {
     }
 
     public String generateToken(User user) {
-        final Instant now = Instant.now();
-        final Instant expiry = now.plus(expirationHours, ChronoUnit.HOURS);
-
         return Jwts.builder()
                 .subject(user.getId())
                 .claim("email", user.getEmail())
                 .claim("role", "ROLE_" + user.getRole().name())
                 .claim("name", user.getName())
-                .issuedAt(Date.from(now))
-                .expiration(Date.from(expiry))
+                .issuedAt(Date.from(Instant.now()))
+                .expiration(Date.from(Instant.now().plus(expirationHours, ChronoUnit.HOURS)))
                 .signWith(secretKey)
                 .compact();
     }

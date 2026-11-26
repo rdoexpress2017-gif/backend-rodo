@@ -3,12 +3,10 @@ package com.hyperplane.rodo.service;
 import com.hyperplane.rodo.dto.CompanyReportSummaryDTO;
 import com.hyperplane.rodo.dto.CustomReportRequestDTO;
 import com.hyperplane.rodo.dto.MotoboyReportAggregateDTO;
-import com.hyperplane.rodo.dto.OrderResponseDTO;
 import com.hyperplane.rodo.dto.ReportDetailResponseDTO;
 import com.hyperplane.rodo.dto.ReportResponseDTO;
 import com.hyperplane.rodo.exception.BusinessRuleException;
 import com.hyperplane.rodo.exception.ResourceNotFoundException;
-import com.hyperplane.rodo.model.BillingCycle;
 import com.hyperplane.rodo.model.Client;
 import com.hyperplane.rodo.model.Order;
 import com.hyperplane.rodo.model.PaymentOrder;
@@ -31,19 +29,21 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.math.BigDecimal;
-import java.time.DayOfWeek;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.YearMonth;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
@@ -67,44 +67,102 @@ public class ReportService {
     private final EmailNotificationService emailNotificationService;
 
     public Flux<ReportResponseDTO> findAll(ReportType type, String targetEntityId) {
-        final Flux<Report> source = (type != null && targetEntityId != null && !targetEntityId.isBlank())
+        return ((type != null && targetEntityId != null && !targetEntityId.isBlank())
                 ? reportRepository.findByTypeAndTargetEntityIdOrderByCreatedAtDesc(type, targetEntityId)
                 : (type != null)
                 ? reportRepository.findByTypeOrderByCreatedAtDesc(type)
-                : reportRepository.findAll();
-
-        return source.concatMap(this::enrichReportResponse);
+                : reportRepository.findAll())
+                .concatMap(this::enrichReportResponse);
     }
 
     public Mono<ReportDetailResponseDTO> findReportDetail(String reportId) {
         return reportRepository.findById(reportId)
                 .switchIfEmpty(Mono.error(new ResourceNotFoundException("Relatório não encontrado: " + reportId)))
-                .flatMap(report -> {
-                    final List<String> orderIds = report.getOrderIds() != null ? report.getOrderIds() : List.of();
-                    return Mono.zip(
-                            enrichReportResponse(report),
-                            orderService.findByIds(orderIds).collectList()
-                    ).map(tuple -> new ReportDetailResponseDTO(tuple.getT1(), tuple.getT2()));
-                });
+                .flatMap(report -> Mono.zip(
+                        enrichReportResponse(report),
+                        orderService.findByIds(report.getOrderIds() != null ? report.getOrderIds() : List.of()).collectList()
+                ).map(tuple -> new ReportDetailResponseDTO(tuple.getT1(), tuple.getT2())));
     }
 
     @Transactional
     public Mono<Void> deleteReport(String reportId) {
         return reportRepository.findById(reportId)
                 .switchIfEmpty(Mono.error(new ResourceNotFoundException("Relatório não encontrado: " + reportId)))
-                .flatMap(report -> {
-                    if (report.getType() == ReportType.CLIENTE) {
-                        return Mono.error(new BusinessRuleException(
+                .flatMap(report -> report.getType() == ReportType.CLIENTE
+                        ? Mono.error(new BusinessRuleException(
                                 "Apenas relatórios de Motoboy e o Relatório RDO da Empresa podem ser excluídos."
-                        ));
-                    }
-                    return reportRepository.delete(report);
-                });
+                        ))
+                        : reportRepository.delete(report));
     }
 
     @Transactional
     public Mono<ReportResponseDTO> generateCustomReport(CustomReportRequestDTO request, String generatedByUserId) {
-        final Flux<Order> matchingOrdersFlux = switch (request.type()) {
+        return resolveMatchingOrdersFlux(request)
+                .collectList()
+                .flatMap(orders -> request.type() == ReportType.EMPRESA
+                        ? generateAndDispatchCompanyReport(
+                                request.startDate(),
+                                request.endDate(),
+                                orders,
+                                generatedByUserId
+                        )
+                        : consolidateReportAndOptionalPaymentOrder(
+                                request.type(),
+                                request.targetEntityId(),
+                                request.startDate(),
+                                request.endDate(),
+                                orders,
+                                request.generatePaymentOrder() && request.type() == ReportType.CLIENTE,
+                                generatedByUserId
+                        ).flatMap(this::enrichReportResponse));
+    }
+
+    public Flux<ReportResponseDTO> processDailyBillingForDate(LocalDate referenceDate) {
+        return hasDailyJobExecuted(referenceDate)
+                .flatMapMany(alreadyExecuted -> Boolean.TRUE.equals(alreadyExecuted)
+                        ? Flux.<ReportResponseDTO>empty().doOnSubscribe(sub ->
+                                log.info("Fechamento automático das 20:00 ignorado: o job de geração de relatórios já foi executado hoje ({}).", referenceDate))
+                        : markDailyJobExecuted(referenceDate).thenMany(processAutomatedBilling(referenceDate, false)));
+    }
+
+    public Flux<ReportResponseDTO> triggerManualDailyBilling(LocalDate referenceDate) {
+        return hasDailyJobExecuted(referenceDate)
+                .flatMapMany(alreadyExecuted -> Boolean.TRUE.equals(alreadyExecuted)
+                        ? Flux.error(new BusinessRuleException(
+                                "O fechamento e geração automática de relatórios já foi executado hoje. Não é permitido executá-lo novamente no mesmo dia."
+                        ))
+                        : markDailyJobExecuted(referenceDate).thenMany(processAutomatedBilling(referenceDate, true)));
+    }
+
+    public Flux<ReportResponseDTO> processAutomatedBilling(LocalDate referenceDate, boolean forceAllActiveCycles) {
+        return Optional.ofNullable(orderRepository.findByCreatedAtBetween(dayStart(referenceDate), dayEnd(referenceDate)))
+                .orElse(Flux.empty())
+                .filter(order -> order.getStatus() != OrderStatus.CANCELADO)
+                .collectList()
+                .flatMapMany(dailyOrders -> clientRepository.findByActiveTrue()
+                        .filter(client -> forceAllActiveCycles || isClientEligibleForBillingOnDate(client, referenceDate))
+                        .concatMap(client -> consolidateClientBillingCycle(client, referenceDate))
+                        .collectList()
+                        .flatMapMany(clientResults -> Flux.fromIterable(
+                                        clientResults.stream().map(Map.Entry::getKey).toList()
+                                )
+                                .concatWith(generateMotoboyReportsForClosing(
+                                        deduplicateOrders(clientResults, dailyOrders),
+                                        dayStart(referenceDate),
+                                        dayEnd(referenceDate)
+                                ))
+                                .concatWith(deduplicateOrders(clientResults, dailyOrders).isEmpty()
+                                        ? Mono.empty()
+                                        : generateAndDispatchCompanyReport(
+                                                dayStart(referenceDate),
+                                                dayEnd(referenceDate),
+                                                deduplicateOrders(clientResults, dailyOrders),
+                                                "SYSTEM_JOB"
+                                        ))));
+    }
+
+    private Flux<Order> resolveMatchingOrdersFlux(CustomReportRequestDTO request) {
+        return switch (request.type()) {
             case CLIENTE -> request.generatePaymentOrder()
                     ? orderRepository.findByClientIdAndStatusAndCreatedAtBetween(
                             request.targetEntityId(), OrderStatus.ENTREGUE, request.startDate(), request.endDate())
@@ -117,161 +175,102 @@ public class ReportService {
             case MASTER, EMPRESA -> orderRepository.findByCreatedAtBetween(request.startDate(), request.endDate())
                     .filter(order -> order.getStatus() != OrderStatus.CANCELADO);
         };
-
-        return matchingOrdersFlux.collectList()
-                .flatMap(orders -> {
-                    if (request.type() == ReportType.EMPRESA) {
-                        return generateAndDispatchCompanyReport(
-                                request.startDate(),
-                                request.endDate(),
-                                orders,
-                                generatedByUserId
-                        );
-                    }
-                    return consolidateReportAndOptionalPaymentOrder(
-                            request.type(),
-                            request.targetEntityId(),
-                            request.startDate(),
-                            request.endDate(),
-                            orders,
-                            request.generatePaymentOrder() && request.type() == ReportType.CLIENTE,
-                            generatedByUserId
-                    ).flatMap(this::enrichReportResponse);
-                });
     }
 
-    public Flux<ReportResponseDTO> processDailyBillingForDate(LocalDate referenceDate) {
-        final Mono<Boolean> alreadyExecutedMono = Optional.ofNullable(settingsService)
+    private Mono<Boolean> hasDailyJobExecuted(LocalDate referenceDate) {
+        return Optional.ofNullable(settingsService)
                 .map(s -> s.hasDailyJobExecutedOnDate(referenceDate))
                 .orElse(Mono.just(false))
                 .defaultIfEmpty(false);
-
-        return alreadyExecutedMono.flatMapMany(alreadyExecuted -> {
-            if (Boolean.TRUE.equals(alreadyExecuted)) {
-                log.info("Fechamento automático das 20:00 ignorado: o job de geração de relatórios já foi executado hoje ({}).", referenceDate);
-                return Flux.empty();
-            }
-            final Mono<?> markMono = Optional.ofNullable(settingsService)
-                    .map(s -> s.markDailyJobExecutedOnDate(referenceDate))
-                    .orElse(Mono.empty());
-            return markMono.thenMany(processAutomatedBilling(referenceDate, false));
-        });
     }
 
-    public Flux<ReportResponseDTO> triggerManualDailyBilling(LocalDate referenceDate) {
-        final Mono<Boolean> alreadyExecutedMono = Optional.ofNullable(settingsService)
-                .map(s -> s.hasDailyJobExecutedOnDate(referenceDate))
-                .orElse(Mono.just(false))
-                .defaultIfEmpty(false);
-
-        return alreadyExecutedMono.flatMapMany(alreadyExecuted -> {
-            if (Boolean.TRUE.equals(alreadyExecuted)) {
-                return Flux.error(new BusinessRuleException(
-                        "O fechamento e geração automática de relatórios já foi executado hoje. Não é permitido executá-lo novamente no mesmo dia."
-                ));
-            }
-            final Mono<?> markMono = Optional.ofNullable(settingsService)
-                    .map(s -> s.markDailyJobExecutedOnDate(referenceDate))
-                    .orElse(Mono.empty());
-            return markMono.thenMany(processAutomatedBilling(referenceDate, true));
-        });
+    private Mono<?> markDailyJobExecuted(LocalDate referenceDate) {
+        return Optional.ofNullable(settingsService)
+                .map(s -> s.markDailyJobExecutedOnDate(referenceDate))
+                .orElse(Mono.empty());
     }
 
-    public Flux<ReportResponseDTO> processAutomatedBilling(LocalDate referenceDate, boolean forceAllActiveCycles) {
-        final Instant dayStart = referenceDate.atStartOfDay(SAO_PAULO_ZONE).toInstant();
-        final Instant periodEnd = referenceDate.atTime(LocalTime.of(23, 59, 59)).atZone(SAO_PAULO_ZONE).toInstant();
+    private Instant dayStart(LocalDate referenceDate) {
+        return referenceDate.atStartOfDay(SAO_PAULO_ZONE).toInstant();
+    }
 
-        // Capture today's non-cancelled orders BEFORE client billing transitions ENTREGUE -> AGUARDANDO_PAGAMENTO,
-        // ensuring motoboys receive their daily 20:00 report even on days when only WEEKLY/MONTHLY clients had deliveries.
-        final Mono<List<Order>> dailyMotoboyOrdersMono = Optional.ofNullable(
-                        orderRepository.findByCreatedAtBetween(dayStart, periodEnd)
+    private Instant dayEnd(LocalDate referenceDate) {
+        return referenceDate.atTime(LocalTime.of(23, 59, 59)).atZone(SAO_PAULO_ZONE).toInstant();
+    }
+
+    private Mono<Map.Entry<ReportResponseDTO, List<Order>>> consolidateClientBillingCycle(
+            Client client,
+            LocalDate referenceDate
+    ) {
+        return orderRepository.findByClientIdAndStatusAndCreatedAtBetween(
+                        client.getId(),
+                        OrderStatus.ENTREGUE,
+                        calculateBillingStartDate(client, referenceDate).atStartOfDay(SAO_PAULO_ZONE).toInstant(),
+                        dayEnd(referenceDate)
                 )
-                .orElse(Flux.empty())
-                .filter(order -> order.getStatus() != OrderStatus.CANCELADO)
-                .collectList();
+                .collectList()
+                .filter(orders -> !orders.isEmpty())
+                .flatMap(orders -> consolidateReportAndOptionalPaymentOrder(
+                        ReportType.CLIENTE,
+                        client.getId(),
+                        calculateBillingStartDate(client, referenceDate).atStartOfDay(SAO_PAULO_ZONE).toInstant(),
+                        dayEnd(referenceDate),
+                        orders,
+                        true,
+                        "SYSTEM_JOB"
+                )
+                .flatMap(this::enrichReportResponse)
+                .map(reportDto -> Map.entry(reportDto, orders)));
+    }
 
-        return dailyMotoboyOrdersMono.flatMapMany(dailyOrders ->
-                clientRepository.findByActiveTrue()
-                        .filter(client -> forceAllActiveCycles || isClientEligibleForBillingOnDate(client, referenceDate))
-                        .concatMap(client -> {
-                            final LocalDate startDate = calculateBillingStartDate(client, referenceDate);
-                            final Instant periodStart = startDate.atStartOfDay(SAO_PAULO_ZONE).toInstant();
-
-                            return orderRepository.findByClientIdAndStatusAndCreatedAtBetween(
-                                            client.getId(), OrderStatus.ENTREGUE, periodStart, periodEnd
-                                    )
-                                    .collectList()
-                                    .filter(orders -> !orders.isEmpty())
-                                    .flatMap(orders -> consolidateReportAndOptionalPaymentOrder(
-                                            ReportType.CLIENTE,
-                                            client.getId(),
-                                            periodStart,
-                                            periodEnd,
-                                            orders,
-                                            true,
-                                            "SYSTEM_JOB"
-                                    )
-                                    .flatMap(this::enrichReportResponse)
-                                    .map(reportDto -> Map.entry(reportDto, orders)));
-                        })
-                        .collectList()
-                        .flatMapMany(clientResults -> {
-                            final List<ReportResponseDTO> clientReports = clientResults.stream()
-                                    .map(Map.Entry::getKey)
-                                    .toList();
-
-                            final List<Order> allBilledOrders = clientResults.stream()
-                                    .flatMap(entry -> entry.getValue().stream())
-                                    .toList();
-
-                            // Merge billed orders + daily orders deduplicated by order ID so daily motoboy closing covers all deliveries
-                            final Map<String, Order> uniqueOrdersById = new LinkedHashMap<>();
-                            Stream.concat(allBilledOrders.stream(), dailyOrders.stream())
-                                    .filter(Objects::nonNull)
-                                    .forEach(order -> {
-                                        final String key = order.getId() != null ? order.getId() : UUID.randomUUID().toString();
-                                        uniqueOrdersById.putIfAbsent(key, order);
-                                    });
-
-                            final Map<String, List<Order>> ordersByMotoboy = uniqueOrdersById.values().stream()
-                                    .filter(o -> o.getMotoboyId() != null && !o.getMotoboyId().isBlank())
-                                    .collect(Collectors.groupingBy(
-                                            Order::getMotoboyId,
-                                            LinkedHashMap::new,
-                                            Collectors.toList()
-                                    ));
-
-                            final Flux<ReportResponseDTO> motoboyReportsFlux = Flux.fromIterable(ordersByMotoboy.entrySet())
-                                    .concatMap(entry -> {
-                                        final String motoboyId = entry.getKey();
-                                        final List<Order> motoboyOrders = entry.getValue();
-                                        final Instant minOrderDate = motoboyOrders.stream()
-                                                .map(Order::getCreatedAt)
-                                                .filter(Objects::nonNull)
-                                                .min(Instant::compareTo)
-                                                .orElse(dayStart);
-
-                                        return consolidateReportAndOptionalPaymentOrder(
-                                                ReportType.MOTOBOY,
-                                                motoboyId,
-                                                minOrderDate,
-                                                periodEnd,
-                                                motoboyOrders,
-                                                false,
-                                                "SYSTEM_JOB"
-                                        ).flatMap(this::enrichReportResponse);
-                                    });
-
-                            final List<Order> companyOrders = List.copyOf(uniqueOrdersById.values());
-                            final Mono<ReportResponseDTO> companyReportMono = companyOrders.isEmpty()
-                                    ? Mono.empty()
-                                    : generateAndDispatchCompanyReport(dayStart, periodEnd, companyOrders, "SYSTEM_JOB");
-
-                            return Flux.fromIterable(clientReports)
-                                    .concatWith(motoboyReportsFlux)
-                                    .concatWith(companyReportMono);
-                        })
+    private List<Order> deduplicateOrders(
+            List<Map.Entry<ReportResponseDTO, List<Order>>> clientResults,
+            List<Order> dailyOrders
+    ) {
+        return List.copyOf(
+                Stream.concat(
+                                clientResults.stream().flatMap(entry -> entry.getValue().stream()),
+                                dailyOrders.stream()
+                        )
+                        .filter(Objects::nonNull)
+                        .collect(Collectors.toMap(
+                                order -> order.getId() != null ? order.getId() : UUID.randomUUID().toString(),
+                                Function.identity(),
+                                (existing, duplicate) -> existing,
+                                LinkedHashMap::new
+                        ))
+                        .values()
         );
+    }
+
+    private Flux<ReportResponseDTO> generateMotoboyReportsForClosing(
+            Collection<Order> uniqueOrders,
+            Instant dayStart,
+            Instant periodEnd
+    ) {
+        return Flux.fromIterable(
+                        uniqueOrders.stream()
+                                .filter(o -> o.getMotoboyId() != null && !o.getMotoboyId().isBlank())
+                                .collect(Collectors.groupingBy(
+                                        Order::getMotoboyId,
+                                        LinkedHashMap::new,
+                                        Collectors.toList()
+                                ))
+                                .entrySet()
+                )
+                .concatMap(entry -> consolidateReportAndOptionalPaymentOrder(
+                        ReportType.MOTOBOY,
+                        entry.getKey(),
+                        entry.getValue().stream()
+                                .map(Order::getCreatedAt)
+                                .filter(Objects::nonNull)
+                                .min(Instant::compareTo)
+                                .orElse(dayStart),
+                        periodEnd,
+                        entry.getValue(),
+                        false,
+                        "SYSTEM_JOB"
+                ).flatMap(this::enrichReportResponse));
     }
 
     private Mono<ReportResponseDTO> generateAndDispatchCompanyReport(
@@ -281,88 +280,70 @@ public class ReportService {
             String generatedByUserId
     ) {
         return buildCompanyReportSummary(orders, periodStart, periodEnd, false, null)
-                .flatMap(initialSummary -> {
-                    final Instant now = Instant.now();
-                    final List<String> orderIds = orders.stream()
-                            .map(Order::getId)
-                            .filter(Objects::nonNull)
-                            .toList();
-                    final double totalDistanceKm = orders.stream()
-                            .map(Order::getRouteDistanceKm)
-                            .filter(Objects::nonNull)
-                            .mapToDouble(Double::doubleValue)
-                            .sum();
-                    final String codeSuffix = UUID.randomUUID().toString().substring(0, 4).toUpperCase();
-                    final String yearMonth = YearMonth.now(SAO_PAULO_ZONE).format(DateTimeFormatter.ofPattern("yyyyMM"));
-                    final String reportCode = "REL-" + yearMonth + "-RDO" + codeSuffix;
+                .flatMap(initialSummary -> reportRepository.save(
+                        Report.builder()
+                                .reportCode(generateReportCode("RDO"))
+                                .type(ReportType.EMPRESA)
+                                .targetEntityId("RDO_EXPRESS")
+                                .orderIds(extractOrderIds(orders))
+                                .periodStart(periodStart)
+                                .periodEnd(periodEnd)
+                                .totalOrders(orders.size())
+                                .totalAmount(initialSummary.totalRevenue())
+                                .totalDistanceKm(roundTwoDecimals(sumDistances(orders)))
+                                .companySummary(initialSummary)
+                                .generatedByUserId(generatedByUserId)
+                                .createdAt(Instant.now())
+                                .updatedAt(Instant.now())
+                                .build()
+                ))
+                .flatMap(this::enrichReportResponse)
+                .flatMap(enrichedDto -> Optional.ofNullable(emailNotificationService)
+                        .map(svc -> svc.sendDailyCompanyReportToMaster(enrichedDto))
+                        .orElse(Mono.just("admin@rodo.com"))
+                        .defaultIfEmpty("admin@rodo.com")
+                        .map(recipient -> withCompanyEmailDispatched(enrichedDto, recipient)));
+    }
 
-                    final Report initialReport = Report.builder()
-                            .reportCode(reportCode)
-                            .type(ReportType.EMPRESA)
-                            .targetEntityId("RDO_EXPRESS")
-                            .orderIds(orderIds)
-                            .periodStart(periodStart)
-                            .periodEnd(periodEnd)
-                            .totalOrders(orders.size())
-                            .totalAmount(initialSummary.totalRevenue())
-                            .totalDistanceKm(Math.round(totalDistanceKm * 100.0) / 100.0)
-                            .companySummary(initialSummary)
-                            .generatedByUserId(generatedByUserId)
-                            .createdAt(now)
-                            .updatedAt(now)
-                            .build();
-
-                    return reportRepository.save(initialReport)
-                            .flatMap(this::enrichReportResponse)
-                            .flatMap(enrichedDto -> {
-                                final Mono<String> emailMono = Optional.ofNullable(emailNotificationService)
-                                        .map(svc -> svc.sendDailyCompanyReportToMaster(enrichedDto))
-                                        .orElse(Mono.just("admin@rodo.com"))
-                                        .defaultIfEmpty("admin@rodo.com");
-
-                                return emailMono.flatMap(recipient -> {
-                                    final CompanyReportSummaryDTO s = enrichedDto.companySummary();
-                                    final CompanyReportSummaryDTO summaryWithEmail = new CompanyReportSummaryDTO(
-                                            s.totalRevenue(),
-                                            s.paidRevenue(),
-                                            s.pendingRevenue(),
-                                            s.netProfit(),
-                                            s.totalCommissions(),
-                                            s.paidCommissions(),
-                                            s.totalExpenses(),
-                                            s.collaboratorShare(),
-                                            s.totalOrders(),
-                                            s.paidOrdersCount(),
-                                            s.pendingOrdersCount(),
-                                            s.motoboyAggregates(),
-                                            s.totalMotoboysAmountToPay(),
-                                            true,
-                                            recipient
-                                    );
-                                    return Mono.just(new ReportResponseDTO(
-                                            enrichedDto.id(),
-                                            enrichedDto.reportCode(),
-                                            enrichedDto.type(),
-                                            enrichedDto.targetEntityId(),
-                                            enrichedDto.targetEntityName(),
-                                            enrichedDto.targetEntitySubtype(),
-                                            enrichedDto.orderIds(),
-                                            enrichedDto.periodStart(),
-                                            enrichedDto.periodEnd(),
-                                            enrichedDto.totalOrders(),
-                                            enrichedDto.totalAmount(),
-                                            enrichedDto.totalDistanceKm(),
-                                            enrichedDto.paymentOrderId(),
-                                            enrichedDto.paymentOrderStatus(),
-                                            enrichedDto.generatedByUserId(),
-                                            enrichedDto.generatedByUserName(),
-                                            enrichedDto.createdAt(),
-                                            enrichedDto.updatedAt(),
-                                            summaryWithEmail
-                                    ));
-                                });
-                            });
-                });
+    private ReportResponseDTO withCompanyEmailDispatched(ReportResponseDTO dto, String recipient) {
+        return new ReportResponseDTO(
+                dto.id(),
+                dto.reportCode(),
+                dto.type(),
+                dto.targetEntityId(),
+                dto.targetEntityName(),
+                dto.targetEntitySubtype(),
+                dto.orderIds(),
+                dto.periodStart(),
+                dto.periodEnd(),
+                dto.totalOrders(),
+                dto.totalAmount(),
+                dto.totalDistanceKm(),
+                dto.paymentOrderId(),
+                dto.paymentOrderStatus(),
+                dto.generatedByUserId(),
+                dto.generatedByUserName(),
+                dto.createdAt(),
+                dto.updatedAt(),
+                new CompanyReportSummaryDTO(
+                        dto.companySummary().totalRevenue(),
+                        dto.companySummary().paidRevenue(),
+                        dto.companySummary().pendingRevenue(),
+                        dto.companySummary().netProfit(),
+                        dto.companySummary().estimatedProfit(),
+                        dto.companySummary().totalCommissions(),
+                        dto.companySummary().paidCommissions(),
+                        dto.companySummary().totalExpenses(),
+                        dto.companySummary().collaboratorShare(),
+                        dto.companySummary().totalOrders(),
+                        dto.companySummary().paidOrdersCount(),
+                        dto.companySummary().pendingOrdersCount(),
+                        dto.companySummary().motoboyAggregates(),
+                        dto.companySummary().totalMotoboysAmountToPay(),
+                        true,
+                        recipient
+                )
+        );
     }
 
     private Mono<CompanyReportSummaryDTO> buildCompanyReportSummary(
@@ -372,150 +353,143 @@ public class ReportService {
             boolean emailSent,
             String recipient
     ) {
-        final Mono<BigDecimal> expensesMono = Optional.ofNullable(expenseService)
-                .map(svc -> svc.sumExpensesInPeriod(periodStart, periodEnd))
-                .orElse(Mono.just(BigDecimal.ZERO))
-                .defaultIfEmpty(BigDecimal.ZERO);
-
-        final Map<String, List<Order>> groupedByMotoboy = orders.stream()
-                .filter(o -> o.getMotoboyId() != null && !o.getMotoboyId().isBlank())
-                .collect(Collectors.groupingBy(
-                        Order::getMotoboyId,
-                        LinkedHashMap::new,
-                        Collectors.toList()
+        return Mono.zip(
+                        Optional.ofNullable(expenseService)
+                                .map(svc -> svc.sumExpensesInPeriod(periodStart, periodEnd))
+                                .orElse(Mono.just(BigDecimal.ZERO))
+                                .defaultIfEmpty(BigDecimal.ZERO),
+                        buildMotoboyAggregates(orders)
+                )
+                .map(tuple -> new CompanyReportSummaryDTO(
+                        sumOrderMoney(orders, o -> true, Order::getAmount),
+                        sumOrderMoney(orders, this::isOrderPaid, Order::getAmount),
+                        sumOrderMoney(orders, o -> !isOrderPaid(o), Order::getAmount),
+                        sumOrderMoney(orders, this::isOrderPaid, Order::getAmount)
+                                .subtract(sumOrderMoney(orders, this::isOrderPaid, Order::getMotoboyCommissionAmount))
+                                .subtract(tuple.getT1()),
+                        sumOrderMoney(orders, this::isOrderCollectedOrForward, Order::getAmount)
+                                .subtract(sumOrderMoney(orders, this::isOrderCollectedOrForward, Order::getMotoboyCommissionAmount))
+                                .subtract(tuple.getT1()),
+                        sumOrderMoney(orders, o -> true, Order::getMotoboyCommissionAmount),
+                        sumOrderMoney(orders, this::isOrderPaid, Order::getMotoboyCommissionAmount),
+                        tuple.getT1(),
+                        sumOrderMoney(orders, o -> true, Order::getMotoboyCommissionAmount),
+                        orders.size(),
+                        orders.stream().filter(this::isOrderPaid).count(),
+                        orders.stream().filter(o -> !isOrderPaid(o)).count(),
+                        tuple.getT2(),
+                        tuple.getT2().stream()
+                                .map(MotoboyReportAggregateDTO::amountToPay)
+                                .filter(Objects::nonNull)
+                                .reduce(BigDecimal.ZERO, BigDecimal::add),
+                        emailSent,
+                        recipient
                 ));
+    }
 
-        final Mono<List<MotoboyReportAggregateDTO>> aggregatesMono = Flux.fromIterable(groupedByMotoboy.entrySet())
-                .concatMap(entry -> {
-                    final String motoboyId = entry.getKey();
-                    final List<Order> mOrders = entry.getValue();
-                    final BigDecimal grossAmount = mOrders.stream()
-                            .map(Order::getAmount)
-                            .filter(Objects::nonNull)
-                            .reduce(BigDecimal.ZERO, BigDecimal::add);
-                    final BigDecimal amountToPay = mOrders.stream()
-                            .map(Order::getMotoboyCommissionAmount)
-                            .filter(Objects::nonNull)
-                            .reduce(BigDecimal.ZERO, BigDecimal::add);
-                    final double distKm = Math.round(mOrders.stream()
-                            .map(Order::getRouteDistanceKm)
-                            .filter(Objects::nonNull)
-                            .mapToDouble(Double::doubleValue)
-                            .sum() * 100.0) / 100.0;
-
-                    return Optional.ofNullable(motoboyRepository.findById(motoboyId))
-                            .orElse(Mono.empty())
-                            .map(m -> new String[]{m.getName(), m.getType() != null ? m.getType().name() : "FIXO"})
-                            .defaultIfEmpty(new String[]{"Motoboy", "FIXO"})
-                            .map(info -> new MotoboyReportAggregateDTO(
-                                    motoboyId,
-                                    info[0],
-                                    info[1],
-                                    mOrders.size(),
-                                    distKm,
-                                    grossAmount,
-                                    amountToPay
-                            ));
-                })
+    private Mono<List<MotoboyReportAggregateDTO>> buildMotoboyAggregates(List<Order> orders) {
+        return Flux.fromIterable(
+                        orders.stream()
+                                .filter(o -> o.getMotoboyId() != null && !o.getMotoboyId().isBlank())
+                                .collect(Collectors.groupingBy(
+                                        Order::getMotoboyId,
+                                        LinkedHashMap::new,
+                                        Collectors.toList()
+                                ))
+                                .entrySet()
+                )
+                .concatMap(entry -> Optional.ofNullable(motoboyRepository.findById(entry.getKey()))
+                        .orElse(Mono.empty())
+                        .map(m -> new String[]{m.getName(), m.getType() != null ? m.getType().name() : "FIXO"})
+                        .defaultIfEmpty(new String[]{"Motoboy", "FIXO"})
+                        .map(info -> new MotoboyReportAggregateDTO(
+                                entry.getKey(),
+                                info[0],
+                                info[1],
+                                entry.getValue().size(),
+                                roundTwoDecimals(sumDistances(entry.getValue())),
+                                sumOrderMoney(entry.getValue(), o -> true, Order::getAmount),
+                                sumOrderMoney(entry.getValue(), o -> true, Order::getMotoboyCommissionAmount)
+                        )))
                 .collectList();
+    }
 
-        return Mono.zip(expensesMono, aggregatesMono)
-                .map(tuple -> {
-                    final BigDecimal totalExpenses = tuple.getT1();
-                    final List<MotoboyReportAggregateDTO> aggregates = tuple.getT2();
+    private boolean isOrderPaid(Order order) {
+        return order != null && order.getStatus() == OrderStatus.PAGO;
+    }
 
-                    final List<Order> paidOrders = orders.stream()
-                            .filter(o -> o.getStatus() == OrderStatus.PAGO)
-                            .toList();
-                    final List<Order> pendingOrders = orders.stream()
-                            .filter(o -> o.getStatus() != OrderStatus.PAGO)
-                            .toList();
+    private boolean isOrderCollectedOrForward(Order order) {
+        return order != null && order.getStatus() != null && switch (order.getStatus()) {
+            case COLETADO, ENTREGUE, AGUARDANDO_PAGAMENTO, PAGO -> true;
+            case PENDENTE, CANCELADO -> false;
+        };
+    }
 
-                    final BigDecimal totalRevenue = orders.stream()
-                            .map(Order::getAmount)
-                            .filter(Objects::nonNull)
-                            .reduce(BigDecimal.ZERO, BigDecimal::add);
-                    final BigDecimal paidRevenue = paidOrders.stream()
-                            .map(Order::getAmount)
-                            .filter(Objects::nonNull)
-                            .reduce(BigDecimal.ZERO, BigDecimal::add);
-                    final BigDecimal pendingRevenue = pendingOrders.stream()
-                            .map(Order::getAmount)
-                            .filter(Objects::nonNull)
-                            .reduce(BigDecimal.ZERO, BigDecimal::add);
+    private BigDecimal sumOrderMoney(
+            List<Order> orders,
+            Predicate<Order> filter,
+            Function<Order, BigDecimal> extractor
+    ) {
+        return orders.stream()
+                .filter(filter)
+                .map(extractor)
+                .filter(Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+    }
 
-                    final BigDecimal totalCommissions = orders.stream()
-                            .map(Order::getMotoboyCommissionAmount)
-                            .filter(Objects::nonNull)
-                            .reduce(BigDecimal.ZERO, BigDecimal::add);
-                    final BigDecimal paidCommissions = paidOrders.stream()
-                            .map(Order::getMotoboyCommissionAmount)
-                            .filter(Objects::nonNull)
-                            .reduce(BigDecimal.ZERO, BigDecimal::add);
+    private double sumDistances(List<Order> orders) {
+        return orders.stream()
+                .map(Order::getRouteDistanceKm)
+                .filter(Objects::nonNull)
+                .mapToDouble(Double::doubleValue)
+                .sum();
+    }
 
-                    // Lucro calculado somente com os pedidos pagos
-                    final BigDecimal netProfit = paidRevenue
-                            .subtract(paidCommissions)
-                            .subtract(totalExpenses);
+    private double roundTwoDecimals(double value) {
+        return Math.round(value * 100.0) / 100.0;
+    }
 
-                    final BigDecimal totalMotoboysAmountToPay = aggregates.stream()
-                            .map(MotoboyReportAggregateDTO::amountToPay)
-                            .filter(Objects::nonNull)
-                            .reduce(BigDecimal.ZERO, BigDecimal::add);
+    private List<String> extractOrderIds(List<Order> orders) {
+        return orders.stream()
+                .map(Order::getId)
+                .filter(Objects::nonNull)
+                .toList();
+    }
 
-                    return new CompanyReportSummaryDTO(
-                            totalRevenue,
-                            paidRevenue,
-                            pendingRevenue,
-                            netProfit,
-                            totalCommissions,
-                            paidCommissions,
-                            totalExpenses,
-                            totalCommissions,
-                            orders.size(),
-                            paidOrders.size(),
-                            pendingOrders.size(),
-                            aggregates,
-                            totalMotoboysAmountToPay,
-                            emailSent,
-                            recipient
-                    );
-                });
+    private String generateReportCode(String prefix) {
+        return "REL-"
+                + YearMonth.now(SAO_PAULO_ZONE).format(DateTimeFormatter.ofPattern("yyyyMM"))
+                + "-"
+                + prefix
+                + UUID.randomUUID().toString().substring(0, 4).toUpperCase();
     }
 
     public boolean isClientEligibleForBillingOnDate(Client client, LocalDate referenceDate) {
-        final BillingCycle cycle = client.getBillingCycle();
-        if (cycle == null || cycle.getType() == null || !client.isActive()) {
-            return false;
-        }
-        return switch (cycle.getType()) {
-            case DAILY -> true;
-            case WEEKLY -> cycle.getEndDayOfWeek() != null
-                    && referenceDate.getDayOfWeek() == cycle.getEndDayOfWeek().toJavaDayOfWeek();
-            case MONTHLY -> referenceDate.equals(referenceDate.withDayOfMonth(referenceDate.lengthOfMonth()));
-        };
+        return client.getBillingCycle() != null
+                && client.getBillingCycle().getType() != null
+                && client.isActive()
+                && switch (client.getBillingCycle().getType()) {
+                    case DAILY -> true;
+                    case WEEKLY -> client.getBillingCycle().getEndDayOfWeek() != null
+                            && referenceDate.getDayOfWeek() == client.getBillingCycle().getEndDayOfWeek().toJavaDayOfWeek();
+                    case MONTHLY -> referenceDate.equals(referenceDate.withDayOfMonth(referenceDate.lengthOfMonth()));
+                };
     }
 
     public LocalDate calculateBillingStartDate(Client client, LocalDate referenceDate) {
-        final BillingCycle cycle = client.getBillingCycle();
-        if (cycle == null || cycle.getType() == null) {
-            return referenceDate;
-        }
-        return switch (cycle.getType()) {
-            case DAILY -> referenceDate;
-            case WEEKLY -> {
-                final LocalDate minusSeven = referenceDate.minusDays(7);
-                final DayOfWeek targetStartDay = cycle.getStartDayOfWeek() != null
-                        ? cycle.getStartDayOfWeek().toJavaDayOfWeek()
-                        : minusSeven.getDayOfWeek();
-                yield IntStream.rangeClosed(0, 7)
-                        .mapToObj(minusSeven::plusDays)
-                        .filter(d -> d.getDayOfWeek() == targetStartDay)
-                        .findFirst()
-                        .orElse(minusSeven);
-            }
-            case MONTHLY -> referenceDate.withDayOfMonth(1);
-        };
+        return (client.getBillingCycle() == null || client.getBillingCycle().getType() == null)
+                ? referenceDate
+                : switch (client.getBillingCycle().getType()) {
+                    case DAILY -> referenceDate;
+                    case WEEKLY -> IntStream.rangeClosed(0, 7)
+                            .mapToObj(referenceDate.minusDays(7)::plusDays)
+                            .filter(d -> d.getDayOfWeek() == (client.getBillingCycle().getStartDayOfWeek() != null
+                                    ? client.getBillingCycle().getStartDayOfWeek().toJavaDayOfWeek()
+                                    : referenceDate.minusDays(7).getDayOfWeek()))
+                            .findFirst()
+                            .orElse(referenceDate.minusDays(7));
+                    case MONTHLY -> referenceDate.withDayOfMonth(1);
+                };
     }
 
     private Mono<Report> consolidateReportAndOptionalPaymentOrder(
@@ -527,75 +501,91 @@ public class ReportService {
             boolean createPaymentOrder,
             String generatedByUserId
     ) {
-        final Instant now = Instant.now();
-        final List<String> orderIds = orders.stream()
-                .map(Order::getId)
-                .filter(Objects::nonNull)
-                .toList();
-
-        final BigDecimal totalAmount = orders.stream()
-                .map(order -> type == ReportType.MOTOBOY ? order.getMotoboyCommissionAmount() : order.getAmount())
-                .filter(Objects::nonNull)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-
-        final double totalDistanceKm = orders.stream()
-                .map(Order::getRouteDistanceKm)
-                .filter(Objects::nonNull)
-                .mapToDouble(Double::doubleValue)
-                .sum();
-
-        final String codeSuffix = UUID.randomUUID().toString().substring(0, 4).toUpperCase();
-        final String yearMonth = YearMonth.now(SAO_PAULO_ZONE).format(DateTimeFormatter.ofPattern("yyyyMM"));
-        final String reportCode = "REL-" + yearMonth + "-" + codeSuffix;
-
-        final Report reportToSave = Report.builder()
-                .reportCode(reportCode)
-                .type(type)
-                .targetEntityId(targetEntityId)
-                .orderIds(orderIds)
-                .periodStart(periodStart)
-                .periodEnd(periodEnd)
-                .totalOrders(orders.size())
-                .totalAmount(totalAmount)
-                .totalDistanceKm(Math.round(totalDistanceKm * 100.0) / 100.0)
-                .generatedByUserId(generatedByUserId)
-                .createdAt(now)
-                .updatedAt(now)
-                .build();
-
-        return reportRepository.save(reportToSave)
-                .flatMap(savedReport -> {
-                    if (!createPaymentOrder || orders.isEmpty()) {
-                        return Mono.just(savedReport);
-                    }
-                    final PaymentOrder paymentOrder = PaymentOrder.builder()
-                            .reportId(savedReport.getId())
-                            .clientId(targetEntityId)
-                            .orderIds(orderIds)
-                            .totalAmount(totalAmount)
-                            .status(PaymentOrderStatus.AGUARDANDO_PAGAMENTO)
-                            .issueDate(now)
-                            .createdAt(now)
-                            .updatedAt(now)
-                            .build();
-
-                    return paymentOrderRepository.save(paymentOrder)
-                            .flatMap(savedPo -> Flux.fromIterable(orders)
-                                    .map(order -> order.toBuilder()
-                                            .status(OrderStatus.AGUARDANDO_PAGAMENTO)
-                                            .paymentOrderId(savedPo.getId())
-                                            .updatedAt(now)
-                                            .build())
-                                    .flatMap(orderRepository::save)
-                                    .then(Mono.just(savedReport)));
-                });
+        return reportRepository.save(
+                        Report.builder()
+                                .reportCode(generateReportCode(""))
+                                .type(type)
+                                .targetEntityId(targetEntityId)
+                                .orderIds(extractOrderIds(orders))
+                                .periodStart(periodStart)
+                                .periodEnd(periodEnd)
+                                .totalOrders(orders.size())
+                                .totalAmount(sumOrderMoney(
+                                        orders,
+                                        o -> true,
+                                        order -> type == ReportType.MOTOBOY ? order.getMotoboyCommissionAmount() : order.getAmount()
+                                ))
+                                .totalDistanceKm(roundTwoDecimals(sumDistances(orders)))
+                                .generatedByUserId(generatedByUserId)
+                                .createdAt(Instant.now())
+                                .updatedAt(Instant.now())
+                                .build()
+                )
+                .flatMap(savedReport -> (!createPaymentOrder || orders.isEmpty())
+                        ? Mono.just(savedReport)
+                        : paymentOrderRepository.save(
+                                PaymentOrder.builder()
+                                        .reportId(savedReport.getId())
+                                        .clientId(targetEntityId)
+                                        .orderIds(extractOrderIds(orders))
+                                        .totalAmount(savedReport.getTotalAmount())
+                                        .status(PaymentOrderStatus.AGUARDANDO_PAGAMENTO)
+                                        .issueDate(Instant.now())
+                                        .createdAt(Instant.now())
+                                        .updatedAt(Instant.now())
+                                        .build()
+                        )
+                        .flatMap(savedPo -> Flux.fromIterable(orders)
+                                .map(order -> order.toBuilder()
+                                        .status(OrderStatus.AGUARDANDO_PAGAMENTO)
+                                        .paymentOrderId(savedPo.getId())
+                                        .updatedAt(Instant.now())
+                                        .build())
+                                .flatMap(orderRepository::save)
+                                .then(Mono.just(savedReport))));
     }
 
     private Mono<ReportResponseDTO> enrichReportResponse(Report report) {
-        final Mono<String[]> entityInfoMono = switch (report.getType()) {
+        return Mono.zip(
+                        resolveTargetEntityInfo(report),
+                        resolvePaymentOrder(report),
+                        resolveGeneratedByName(report)
+                )
+                .map(tuple -> new ReportResponseDTO(
+                        report.getId(),
+                        report.getReportCode(),
+                        report.getType(),
+                        report.getTargetEntityId(),
+                        tuple.getT1()[0],
+                        tuple.getT1()[1],
+                        report.getOrderIds() != null ? report.getOrderIds() : List.of(),
+                        report.getPeriodStart(),
+                        report.getPeriodEnd(),
+                        report.getTotalOrders(),
+                        report.getTotalAmount(),
+                        report.getTotalDistanceKm(),
+                        tuple.getT2().getId(),
+                        tuple.getT2().getStatus(),
+                        report.getGeneratedByUserId(),
+                        tuple.getT3(),
+                        report.getCreatedAt(),
+                        tuple.getT2().getUpdatedAt() != null
+                                ? tuple.getT2().getUpdatedAt()
+                                : (report.getUpdatedAt() != null ? report.getUpdatedAt() : report.getCreatedAt()),
+                        report.getCompanySummary()
+                ));
+    }
+
+    private Mono<String[]> resolveTargetEntityInfo(Report report) {
+        return switch (report.getType()) {
             case CLIENTE -> report.getTargetEntityId() != null
                     ? clientRepository.findById(report.getTargetEntityId())
-                            .map(c -> new String[]{c.getName(), c.getBillingCycle() != null && c.getBillingCycle().getType() != null ? c.getBillingCycle().getType().name() : "CLIENTE"})
+                            .map(c -> new String[]{
+                                    c.getName(),
+                                    c.getBillingCycle() != null && c.getBillingCycle().getType() != null
+                                            ? c.getBillingCycle().getType().name()
+                                            : "CLIENTE"
+                            })
                             .defaultIfEmpty(new String[]{"Cliente", "CLIENTE"})
                     : Mono.just(new String[]{"Cliente", "CLIENTE"});
             case MOTOBOY -> report.getTargetEntityId() != null
@@ -606,45 +596,17 @@ public class ReportService {
             case MASTER -> Mono.just(new String[]{"Consolidado Geral", "MASTER"});
             case EMPRESA -> Mono.just(new String[]{"RDO Express (Resumo Geral)", "EMPRESA"});
         };
+    }
 
-        final Mono<PaymentOrder> paymentOrderMono = report.getType() == ReportType.CLIENTE && report.getId() != null
+    private Mono<PaymentOrder> resolvePaymentOrder(Report report) {
+        return report.getType() == ReportType.CLIENTE && report.getId() != null
                 ? paymentOrderRepository.findByReportId(report.getId()).defaultIfEmpty(PaymentOrder.builder().build())
                 : Mono.just(PaymentOrder.builder().build());
+    }
 
-        final Mono<String> generatedByNameMono = (report.getGeneratedByUserId() != null && !report.getGeneratedByUserId().equals("SYSTEM_JOB"))
+    private Mono<String> resolveGeneratedByName(Report report) {
+        return (report.getGeneratedByUserId() != null && !report.getGeneratedByUserId().equals("SYSTEM_JOB"))
                 ? userRepository.findById(report.getGeneratedByUserId()).map(User::getName).defaultIfEmpty("Administrador")
                 : Mono.just("Robô Automático");
-
-        return Mono.zip(entityInfoMono, paymentOrderMono, generatedByNameMono)
-                .map(tuple -> {
-                    final String[] entityInfo = tuple.getT1();
-                    final PaymentOrder po = tuple.getT2();
-                    final String generatedByName = tuple.getT3();
-                    final List<String> orderIds = report.getOrderIds() != null ? report.getOrderIds() : List.of();
-                    final Instant effectiveUpdatedAt = po.getUpdatedAt() != null
-                            ? po.getUpdatedAt()
-                            : (report.getUpdatedAt() != null ? report.getUpdatedAt() : report.getCreatedAt());
-                    return new ReportResponseDTO(
-                            report.getId(),
-                            report.getReportCode(),
-                            report.getType(),
-                            report.getTargetEntityId(),
-                            entityInfo[0],
-                            entityInfo[1],
-                            orderIds,
-                            report.getPeriodStart(),
-                            report.getPeriodEnd(),
-                            report.getTotalOrders(),
-                            report.getTotalAmount(),
-                            report.getTotalDistanceKm(),
-                            po.getId(),
-                            po.getStatus(),
-                            report.getGeneratedByUserId(),
-                            generatedByName,
-                            report.getCreatedAt(),
-                            effectiveUpdatedAt,
-                            report.getCompanySummary()
-                    );
-                });
     }
 }

@@ -8,6 +8,7 @@ public record CompanyReportSummaryDTO(
         BigDecimal paidRevenue,
         BigDecimal pendingRevenue,
         BigDecimal netProfit,
+        BigDecimal estimatedProfit,
         BigDecimal totalCommissions,
         BigDecimal paidCommissions,
         BigDecimal totalExpenses,

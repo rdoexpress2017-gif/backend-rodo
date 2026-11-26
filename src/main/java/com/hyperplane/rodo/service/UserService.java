@@ -38,16 +38,15 @@ public class UserService {
     public Mono<UserResponseDTO> create(UserRequestDTO requestDTO) {
         return userRepository.findByEmail(requestDTO.email())
                 .flatMap(existing -> Mono.<UserResponseDTO>error(new BusinessRuleException("Email já cadastrado: " + requestDTO.email())))
-                .switchIfEmpty(Mono.defer(() -> {
-                    final String rawPassword = requestDTO.password() != null && !requestDTO.password().isBlank()
-                            ? requestDTO.password()
-                            : "Mudar@123";
-                    return Mono.just(userMapper.toEntity(requestDTO).toBuilder()
-                                    .passwordHash(passwordEncoder.encode(rawPassword))
-                                    .build())
-                            .flatMap(userRepository::save)
-                            .map(userMapper::toResponseDTO);
-                }));
+                .switchIfEmpty(Mono.defer(() -> Mono.just(userMapper.toEntity(requestDTO).toBuilder()
+                                .passwordHash(passwordEncoder.encode(
+                                        requestDTO.password() != null && !requestDTO.password().isBlank()
+                                                ? requestDTO.password()
+                                                : "Mudar@123"
+                                ))
+                                .build())
+                        .flatMap(userRepository::save)
+                        .map(userMapper::toResponseDTO)));
     }
 
     public Mono<UserResponseDTO> update(String id, UserRequestDTO requestDTO) {

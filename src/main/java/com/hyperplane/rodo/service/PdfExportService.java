@@ -17,6 +17,7 @@ import com.lowagie.text.Rectangle;
 import com.lowagie.text.pdf.PdfPCell;
 import com.lowagie.text.pdf.PdfPTable;
 import com.lowagie.text.pdf.PdfWriter;
+import io.vavr.CheckedConsumer;
 import io.vavr.control.Try;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -35,7 +36,11 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 @Service
 @Slf4j
@@ -47,7 +52,6 @@ public class PdfExportService {
     private static final DateTimeFormatter DATE_TIME_FMT = DateTimeFormatter.ofPattern("dd/MM/yyyy, HH:mm").withZone(SAO_PAULO_ZONE);
     private static final Locale PT_BR = Locale.of("pt", "BR");
 
-    // Executive Color Palette
     private static final Color NAVY_BG = new Color(22, 29, 47);
     private static final Color BRAND_RED = new Color(217, 45, 58);
     private static final Color SLATE_900 = new Color(15, 23, 42);
@@ -82,342 +86,284 @@ public class PdfExportService {
 
     public Mono<byte[]> generateReportPdf(String reportId) {
         return Mono.zip(
-                        reportService.findReportDetail(reportId),
-                        settingsService.getSettings()
-                )
-                .flatMap(tuple -> {
-                    final ReportDetailResponseDTO detail = tuple.getT1();
-                    final Double configuredPct = tuple.getT2().defaultMotoboyCommissionPercentage();
-                    final double motoboyPct = configuredPct != null ? configuredPct : 70.0;
-                    return Mono.fromCallable(() -> renderPdfBytes(detail, motoboyPct))
-                            .subscribeOn(Schedulers.boundedElastic());
-                });
+                reportService.findReportDetail(reportId),
+                settingsService.getSettings())
+        .flatMap(tuple -> Mono.fromCallable(() ->
+                renderPdfBytes(tuple.getT1(), tuple.getT2().defaultMotoboyCommissionPercentage() != null ? tuple.getT2().defaultMotoboyCommissionPercentage() : 70.0))
+                .subscribeOn(Schedulers.boundedElastic()));
     }
 
     private String formatPercentage(double pct) {
-        if (pct == Math.floor(pct)) {
-            return String.format("%d%%", Math.round(pct));
-        }
-        return String.format(PT_BR, "%.1f%%", pct);
+        return pct == Math.floor(pct)
+                ? String.format("%d%%", Math.round(pct))
+                : String.format(PT_BR, "%.1f%%", pct);
+    }
+
+    private String formatCurrency(BigDecimal amount) {
+        return NumberFormat.getCurrencyInstance(PT_BR).format(amount != null ? amount : BigDecimal.ZERO);
+    }
+
+    private String formatStartDate(ReportResponseDTO report) {
+        return report.periodStart() != null ? DATE_FMT.format(report.periodStart()) : "-";
+    }
+
+    private String formatEndDate(ReportResponseDTO report) {
+        return report.periodEnd() != null ? DATE_FMT.format(report.periodEnd()) : "-";
+    }
+
+    private String resolveEntityUpper(ReportResponseDTO report) {
+        return (report.targetEntityName() != null ? report.targetEntityName() : "RELATÓRIO").toUpperCase();
+    }
+
+    private List<OrderResponseDTO> safeOrders(ReportDetailResponseDTO detail) {
+        return detail.orders() != null ? detail.orders() : List.of();
     }
 
     private byte[] renderPdfBytes(ReportDetailResponseDTO detail, double motoboyPct) {
-        return Try.of(() -> {
-            final ByteArrayOutputStream out = new ByteArrayOutputStream();
-            final Document document = new Document(PageSize.A4, 26, 26, 26, 26);
-            PdfWriter.getInstance(document, out);
-            document.open();
-
-            final ReportResponseDTO report = detail.report();
-            final List<OrderResponseDTO> orders = detail.orders() != null ? detail.orders() : List.of();
-            final NumberFormat currencyFmt = NumberFormat.getCurrencyInstance(PT_BR);
-
-            final String startStr = report.periodStart() != null ? DATE_FMT.format(report.periodStart()) : "-";
-            final String endStr = report.periodEnd() != null ? DATE_FMT.format(report.periodEnd()) : "-";
-            final String entityUpper = (report.targetEntityName() != null ? report.targetEntityName() : "RELATÓRIO").toUpperCase();
-
-            // 1. Executive Dark Navy Header Banner with Brand Accent
-            addTopBanner(document, report, entityUpper, startStr, endStr);
-
-            // 2. Section "Informações do Relatório" (4 separated cards with gaps)
-            addInformationsSection(document, report, startStr, endStr);
-
-            if (report.type() == ReportType.EMPRESA && report.companySummary() != null) {
-                // 3A. Company RDO Report: 8 separated KPI cards + Motoboy Aggregate Table + Orders
-                addCompanyResumoGeralSection(document, report.companySummary(), currencyFmt);
-                addOrdersGroupedByDateSection(document, orders, currencyFmt);
+        return withPdfDocument(document -> {
+            addTopBanner(document, detail.report());
+            addInformationsSection(document, detail.report());
+            if (detail.report().type() == ReportType.EMPRESA && detail.report().companySummary() != null) {
+                addCompanyResumoGeralSection(document, detail.report().companySummary(), safeOrders(detail));
+                addOrdersGroupedByDateSection(document, safeOrders(detail));
             } else {
-                // 3B. Client or Motoboy Report: Entity Identification + Orders + Division Summary
-                addEntityUsernameSection(document, report);
-                addOrdersGroupedByDateSection(document, orders, currencyFmt);
-                addSummarySection(document, report, orders, currencyFmt, motoboyPct);
+                addEntityUsernameSection(document, detail.report());
+                addOrdersGroupedByDateSection(document, safeOrders(detail));
+                addSummarySection(document, detail.report(), safeOrders(detail), motoboyPct);
             }
-
-            document.close();
-            return out.toByteArray();
-        }).getOrElseThrow(ex -> new IllegalStateException("Falha ao gerar PDF do relatório: " + ex.getMessage(), ex));
+        });
     }
 
-    private void addTopBanner(
-            Document document,
-            ReportResponseDTO report,
-            String entityUpper,
-            String startStr,
-            String endStr
-    ) throws Exception {
-        final PdfPTable banner = new PdfPTable(new float[]{2.8f, 1.2f});
-        banner.setWidthPercentage(100);
-        banner.setSpacingAfter(16f);
-
-        final Font brandTagFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 7.5f, new Color(248, 113, 113));
-        final Font bannerTitleFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 13f, Color.WHITE);
-        final Font bannerSubFont = FontFactory.getFont(FontFactory.HELVETICA, 8.5f, new Color(203, 213, 225));
-        final Font codeFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, Color.WHITE);
-
-        final Paragraph leftP = new Paragraph();
-        leftP.setLeading(14f);
-        leftP.add(new Phrase("RDO EXPRESS • DEMONSTRATIVO OFICIAL\n", brandTagFont));
-        leftP.add(new Phrase(String.format("%s\n", entityUpper), bannerTitleFont));
-        leftP.add(new Phrase(String.format("Período de Apuração: %s a %s", startStr, endStr), bannerSubFont));
-
-        final PdfPCell leftCell = new PdfPCell(leftP);
-        leftCell.setBackgroundColor(NAVY_BG);
-        leftCell.setBorder(Rectangle.BOTTOM);
-        leftCell.setBorderColorBottom(BRAND_RED);
-        leftCell.setBorderWidthBottom(3f);
-        leftCell.setPadding(15f);
-        banner.addCell(leftCell);
-
-        final Paragraph rightP = new Paragraph();
-        rightP.setLeading(13f);
-        rightP.add(new Phrase("CÓDIGO DO RELATÓRIO\n", bannerSubFont));
-        rightP.add(new Phrase((report.reportCode() != null ? report.reportCode() : "-") + "\n", codeFont));
-        rightP.add(new Phrase(
-                report.createdAt() != null ? "Emissão: " + DATE_TIME_FMT.format(report.createdAt()) : "",
-                bannerSubFont
-        ));
-
-        final PdfPCell rightCell = new PdfPCell(rightP);
-        rightCell.setBackgroundColor(NAVY_BG);
-        rightCell.setHorizontalAlignment(Element.ALIGN_RIGHT);
-        rightCell.setVerticalAlignment(Element.ALIGN_MIDDLE);
-        rightCell.setBorder(Rectangle.BOTTOM);
-        rightCell.setBorderColorBottom(BRAND_RED);
-        rightCell.setBorderWidthBottom(3f);
-        rightCell.setPadding(15f);
-        banner.addCell(rightCell);
-
-        document.add(banner);
+    private byte[] withPdfDocument(CheckedConsumer<Document> consumer) {
+        return Try.of(() -> configureAndExport(new ByteArrayOutputStream(), new Document(PageSize.A4, 26, 26, 26, 26), consumer))
+                .getOrElseThrow(ex -> new IllegalStateException("Falha ao gerar PDF do relatório: " + ex.getMessage(), ex));
     }
 
-    private void addInformationsSection(
-            Document document,
-            ReportResponseDTO report,
-            String startStr,
-            String endStr
-    ) throws Exception {
-        final Font sectionFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 9.5f, NAVY_BG);
-        final Paragraph infoTitle = new Paragraph("INFORMAÇÕES DO RELATÓRIO", sectionFont);
-        infoTitle.setSpacingAfter(6f);
-        document.add(infoTitle);
+    private byte[] configureAndExport(ByteArrayOutputStream out, Document document, CheckedConsumer<Document> consumer) throws Throwable {
+        PdfWriter.getInstance(document, out);
+        document.open();
+        consumer.accept(document);
+        document.close();
+        return out.toByteArray();
+    }
 
-        // 4 cards with 3 spacer columns between them
-        final PdfPTable infoGrid = new PdfPTable(new float[]{1f, 0.03f, 1.15f, 0.03f, 1f, 0.03f, 0.95f});
-        infoGrid.setWidthPercentage(100);
-        infoGrid.setSpacingAfter(16f);
+    private PdfPTable buildTable(float[] widths, float spacingAfter, Consumer<PdfPTable> builder) {
+        return configureElement(new PdfPTable(widths), table -> {
+            table.setWidthPercentage(100);
+            table.setSpacingAfter(spacingAfter);
+            builder.accept(table);
+        });
+    }
 
-        final String typeLabel = report.type() == ReportType.CLIENTE ? "Cliente"
+    private PdfPCell buildCell(Phrase phrase, Consumer<PdfPCell> customizer) {
+        return configureElement(new PdfPCell(phrase), customizer);
+    }
+
+    private PdfPCell buildCell(Paragraph paragraph, Consumer<PdfPCell> customizer) {
+        return configureElement(new PdfPCell(paragraph), customizer);
+    }
+
+    private PdfPCell buildCell(PdfPTable innerTable, Consumer<PdfPCell> customizer) {
+        return configureElement(new PdfPCell(innerTable), customizer);
+    }
+
+    private Paragraph buildParagraph(float leading, Consumer<Paragraph> builder) {
+        return configureElement(new Paragraph(), p -> {
+            p.setLeading(leading);
+            builder.accept(p);
+        });
+    }
+
+    private Paragraph buildSectionTitle(String text, float spacingAfter) {
+        return configureElement(
+                new Paragraph(text, FontFactory.getFont(FontFactory.HELVETICA_BOLD, 9.5f, NAVY_BG)),
+                p -> p.setSpacingAfter(spacingAfter)
+        );
+    }
+
+    private <T> T configureElement(T element, Consumer<T> customizer) {
+        customizer.accept(element);
+        return element;
+    }
+
+    private void addTopBanner(Document document, ReportResponseDTO report) throws Exception {
+        document.add(buildTable(new float[]{2.8f, 1.2f}, 16f, banner -> {
+            banner.addCell(buildCell(
+                    buildParagraph(14f, p -> {
+                        p.add(new Phrase("RDO EXPRESS • DEMONSTRATIVO OFICIAL\n", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 7.5f, new Color(248, 113, 113))));
+                        p.add(new Phrase(String.format("%s\n", resolveEntityUpper(report)), FontFactory.getFont(FontFactory.HELVETICA_BOLD, 13f, Color.WHITE)));
+                        p.add(new Phrase(String.format("Período de Apuração: %s a %s", formatStartDate(report), formatEndDate(report)), FontFactory.getFont(FontFactory.HELVETICA, 8.5f, new Color(203, 213, 225))));
+                    }),
+                    cell -> {
+                        cell.setBackgroundColor(NAVY_BG);
+                        cell.setBorder(Rectangle.BOTTOM);
+                        cell.setBorderColorBottom(BRAND_RED);
+                        cell.setBorderWidthBottom(3f);
+                        cell.setPadding(15f);
+                    }
+            ));
+            banner.addCell(buildCell(
+                    buildParagraph(13f, p -> {
+                        p.add(new Phrase("CÓDIGO DO RELATÓRIO\n", FontFactory.getFont(FontFactory.HELVETICA, 8.5f, new Color(203, 213, 225))));
+                        p.add(new Phrase((report.reportCode() != null ? report.reportCode() : "-") + "\n", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, Color.WHITE)));
+                        p.add(new Phrase(report.createdAt() != null ? "Emissão: " + DATE_TIME_FMT.format(report.createdAt()) : "", FontFactory.getFont(FontFactory.HELVETICA, 8.5f, new Color(203, 213, 225))));
+                    }),
+                    cell -> {
+                        cell.setBackgroundColor(NAVY_BG);
+                        cell.setHorizontalAlignment(Element.ALIGN_RIGHT);
+                        cell.setVerticalAlignment(Element.ALIGN_MIDDLE);
+                        cell.setBorder(Rectangle.BOTTOM);
+                        cell.setBorderColorBottom(BRAND_RED);
+                        cell.setBorderWidthBottom(3f);
+                        cell.setPadding(15f);
+                    }
+            ));
+        }));
+    }
+
+    private void addInformationsSection(Document document, ReportResponseDTO report) throws Exception {
+        document.add(buildSectionTitle("INFORMAÇÕES DO RELATÓRIO", 6f));
+        document.add(buildTable(new float[]{1f, 0.03f, 1.15f, 0.03f, 1f, 0.03f, 0.95f}, 16f, infoGrid -> {
+            addStackedMetadataCard(infoGrid, "CATEGORIA", resolveTypeLabel(report));
+            addSpacerCell(infoGrid);
+            addStackedMetadataCard(infoGrid, "PERÍODO APURADO", formatStartDate(report) + " a " + formatEndDate(report));
+            addSpacerCell(infoGrid);
+            addStackedMetadataCard(infoGrid, "GERADO POR", report.generatedByUserName() != null ? report.generatedByUserName() : "Sistema");
+            addSpacerCell(infoGrid);
+            addStackedMetadataCard(infoGrid, "DATA / HORA", report.createdAt() != null ? DATE_TIME_FMT.format(report.createdAt()) : "-");
+        }));
+    }
+
+    private String resolveTypeLabel(ReportResponseDTO report) {
+        return report.type() == ReportType.CLIENTE ? "Cliente"
                 : (report.type() == ReportType.MOTOBOY ? "Motoboy"
                 : (report.type() == ReportType.EMPRESA ? "Empresa (RDO)" : "Master"));
-        final String generatedBy = report.generatedByUserName() != null ? report.generatedByUserName() : "Sistema";
-        final String createdTime = report.createdAt() != null ? DATE_TIME_FMT.format(report.createdAt()) : "-";
-
-        addStackedMetadataCard(infoGrid, "CATEGORIA", typeLabel);
-        addSpacerCell(infoGrid);
-        addStackedMetadataCard(infoGrid, "PERÍODO APURADO", startStr + " a " + endStr);
-        addSpacerCell(infoGrid);
-        addStackedMetadataCard(infoGrid, "GERADO POR", generatedBy);
-        addSpacerCell(infoGrid);
-        addStackedMetadataCard(infoGrid, "DATA / HORA", createdTime);
-
-        document.add(infoGrid);
     }
 
     private void addStackedMetadataCard(PdfPTable grid, String label, String value) {
-        final Font lblFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 7f, SLATE_500);
-        final Font valFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 9f, SLATE_900);
-
-        final Paragraph p = new Paragraph();
-        p.setLeading(12f);
-        p.add(new Phrase(label + "\n", lblFont));
-        p.add(new Phrase(value, valFont));
-
-        final PdfPCell cell = new PdfPCell(p);
-        cell.setBackgroundColor(ZEBRA_BG);
-        cell.setBorderColor(BORDER_LIGHT);
-        cell.setBorderWidth(0.8f);
-        cell.setPadding(9f);
-        grid.addCell(cell);
+        grid.addCell(buildCell(
+                buildParagraph(12f, p -> {
+                    p.add(new Phrase(label + "\n", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 7f, SLATE_500)));
+                    p.add(new Phrase(value, FontFactory.getFont(FontFactory.HELVETICA_BOLD, 9f, SLATE_900)));
+                }),
+                cell -> {
+                    cell.setBackgroundColor(ZEBRA_BG);
+                    cell.setBorderColor(BORDER_LIGHT);
+                    cell.setBorderWidth(0.8f);
+                    cell.setPadding(9f);
+                }
+        ));
     }
 
     private void addSpacerCell(PdfPTable grid) {
-        final PdfPCell spacer = new PdfPCell(new Phrase(""));
-        spacer.setBorder(Rectangle.NO_BORDER);
-        grid.addCell(spacer);
+        grid.addCell(buildCell(new Phrase(""), cell -> cell.setBorder(Rectangle.NO_BORDER)));
+    }
+
+    private BigDecimal resolveEstimatedProfit(CompanyReportSummaryDTO s, List<OrderResponseDTO> orders) {
+        return s.estimatedProfit() != null
+                ? s.estimatedProfit()
+                : (orders != null && !orders.isEmpty()
+                        ? sumEligibleOrders(orders, OrderResponseDTO::amount)
+                                .subtract(sumEligibleOrders(orders, OrderResponseDTO::motoboyCommissionAmount))
+                                .subtract(s.totalExpenses() != null ? s.totalExpenses() : BigDecimal.ZERO)
+                        : (s.totalRevenue() != null ? s.totalRevenue() : BigDecimal.ZERO)
+                                .subtract(s.totalCommissions() != null ? s.totalCommissions() : BigDecimal.ZERO)
+                                .subtract(s.totalExpenses() != null ? s.totalExpenses() : BigDecimal.ZERO));
+    }
+
+    private BigDecimal sumEligibleOrders(List<OrderResponseDTO> orders, Function<OrderResponseDTO, BigDecimal> extractor) {
+        return orders.stream()
+                .filter(o -> o != null && o.status() != null && switch (o.status()) {
+                    case COLETADO, ENTREGUE, AGUARDANDO_PAGAMENTO, PAGO -> true;
+                    case PENDENTE, CANCELADO -> false;
+                })
+                .map(extractor)
+                .filter(Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
     }
 
     private void addCompanyResumoGeralSection(
             Document document,
             CompanyReportSummaryDTO s,
-            NumberFormat currencyFmt
+            List<OrderResponseDTO> orders
     ) throws Exception {
-        final Font sectionFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 9.5f, NAVY_BG);
-        final Paragraph title = new Paragraph("RESUMO GERAL (FINANCEIRO RDO)", sectionFont);
-        title.setSpacingAfter(7f);
-        document.add(title);
+        document.add(buildSectionTitle("RESUMO GERAL (FINANCEIRO RDO)", 7f));
 
-        final float[] fourCardsWidths = new float[]{1f, 0.03f, 1f, 0.03f, 1f, 0.03f, 1f};
+        document.add(buildTable(new float[]{1f, 0.03f, 1f, 0.03f, 1f, 0.03f, 1f}, 7f, row1 -> {
+            addKpiCard(row1, "RECEITAS", formatCurrency(s.totalRevenue()), String.format("Valor total de pedidos (%d)", s.totalOrders()), Color.WHITE, BORDER_LIGHT, SLATE_700, SLATE_900, SLATE_500);
+            addSpacerCell(row1);
+            addKpiCard(row1, "JÁ RECEBIDO", formatCurrency(s.paidRevenue()), String.format("%d pagos em caixa", s.paidOrdersCount()), GREEN_BOX_BG, GREEN_BORDER, GREEN_TEXT, GREEN_TEXT, GREEN_TEXT);
+            addSpacerCell(row1);
+            addKpiCard(row1, "A RECEBER", formatCurrency(s.pendingRevenue()), String.format("%d a receber (não pagos)", s.pendingOrdersCount()), AMBER_BG, AMBER_BORDER, AMBER_TEXT, AMBER_TEXT, AMBER_TEXT);
+            addSpacerCell(row1);
+            addKpiCard(row1, "REGISTROS", String.valueOf(s.totalOrders()), String.format("%d pagos • %d pendentes", s.paidOrdersCount(), s.pendingOrdersCount()), ZEBRA_BG, BORDER_LIGHT, SLATE_700, AMBER_TEXT, SLATE_500);
+        }));
 
-        // Row 1 of KPI Cards: RECEITAS | JÁ RECEBIDO | A RECEBER | LUCRO
-        final PdfPTable row1 = new PdfPTable(fourCardsWidths);
-        row1.setWidthPercentage(100);
-        row1.setSpacingAfter(7f);
+        document.add(buildTable(new float[]{1f, 0.03f, 1f, 0.03f, 1f, 0.03f, 1f}, 7f, row2 -> {
+            addKpiCard(row2, "LUCRO REAL", formatCurrency(s.netProfit()), "Somente sobre pedidos pagos", ZEBRA_BG, BORDER_LIGHT, SLATE_700, SLATE_900, SLATE_500);
+            addSpacerCell(row2);
+            addKpiCard(row2, "LUCRO ESTIMADO", formatCurrency(resolveEstimatedProfit(s, orders)), "Pedidos coletados em diante", BLUE_BOX_BG, BLUE_BORDER, BLUE_TEXT, BLUE_TEXT, BLUE_TEXT);
+            addSpacerCell(row2);
+            addKpiCard(row2, "REPASSES", formatCurrency(s.totalCommissions()), String.format("Pagos: %s", formatCurrency(s.paidCommissions())), ROSE_BOX_BG, ROSE_BORDER, ROSE_TEXT, SLATE_900, ROSE_TEXT);
+            addSpacerCell(row2);
+            addKpiCard(row2, "DESPESAS", formatCurrency(s.totalExpenses()), "Lançamentos do período", PURPLE_BOX_BG, PURPLE_BORDER, PURPLE_TEXT, PURPLE_TEXT, SLATE_500);
+        }));
 
-        addKpiCard(
-                row1,
-                "RECEITAS",
-                currencyFmt.format(s.totalRevenue()),
-                String.format("Valor total de pedidos (%d)", s.totalOrders()),
-                Color.WHITE,
-                BORDER_LIGHT,
-                SLATE_700,
-                SLATE_900,
-                SLATE_500
-        );
-        addSpacerCell(row1);
-        addKpiCard(
-                row1,
-                "JÁ RECEBIDO",
-                currencyFmt.format(s.paidRevenue()),
-                String.format("%d pagos em caixa", s.paidOrdersCount()),
-                GREEN_BOX_BG,
-                GREEN_BORDER,
-                GREEN_TEXT,
-                GREEN_TEXT,
-                GREEN_TEXT
-        );
-        addSpacerCell(row1);
-        addKpiCard(
-                row1,
-                "A RECEBER",
-                currencyFmt.format(s.pendingRevenue()),
-                String.format("%d a receber (não pagos)", s.pendingOrdersCount()),
-                AMBER_BG,
-                AMBER_BORDER,
-                AMBER_TEXT,
-                AMBER_TEXT,
-                AMBER_TEXT
-        );
-        addSpacerCell(row1);
-        addKpiCard(
-                row1,
-                "LUCRO",
-                currencyFmt.format(s.netProfit()),
-                "Somente sobre pedidos pagos",
-                ZEBRA_BG,
-                BORDER_LIGHT,
-                SLATE_700,
-                SLATE_900,
-                SLATE_500
-        );
-        document.add(row1);
+        document.add(buildTable(new float[]{1f, 0.03f, 3.09f}, 18f, row3 -> {
+            addKpiCard(row3, "COLABORADOR", formatCurrency(s.collaboratorShare()), "Comissão motoboys no período", BLUE_BOX_BG, BLUE_BORDER, BLUE_TEXT, BLUE_TEXT, SLATE_500);
+            addSpacerCell(row3);
+            row3.addCell(buildCell(
+                    new Phrase(
+                            "■ Demonstrativo da Empresa: O Lucro Real reflete o valor recebido em caixa (pedidos pagos) descontando repasses e despesas. O Lucro Estimado projeta o resultado considerando todos os pedidos a partir do status Coletado (em rota/entregues/pagos).",
+                            FontFactory.getFont(FontFactory.HELVETICA, 7.5f, SLATE_700)
+                    ),
+                    cell -> {
+                        cell.setBackgroundColor(SLATE_HEADER_BG);
+                        cell.setBorderColor(BORDER_LIGHT);
+                        cell.setPadding(9.5f);
+                        cell.setVerticalAlignment(Element.ALIGN_MIDDLE);
+                    }
+            ));
+        }));
 
-        // Row 2 of KPI Cards: REPASSES | DESPESAS | COLABORADOR | REGISTROS
-        final PdfPTable row2 = new PdfPTable(fourCardsWidths);
-        row2.setWidthPercentage(100);
-        row2.setSpacingAfter(18f);
+        document.add(buildSectionTitle("AGREGADO POR MOTOBOY (VALORES A PAGAR NO DIA)", 7f));
 
-        addKpiCard(
-                row2,
-                "REPASSES",
-                currencyFmt.format(s.totalCommissions()),
-                String.format("Pagos: %s", currencyFmt.format(s.paidCommissions())),
-                ROSE_BOX_BG,
-                ROSE_BORDER,
-                ROSE_TEXT,
-                SLATE_900,
-                ROSE_TEXT
-        );
-        addSpacerCell(row2);
-        addKpiCard(
-                row2,
-                "DESPESAS",
-                currencyFmt.format(s.totalExpenses()),
-                "Lançamentos do período",
-                PURPLE_BOX_BG,
-                PURPLE_BORDER,
-                PURPLE_TEXT,
-                PURPLE_TEXT,
-                SLATE_500
-        );
-        addSpacerCell(row2);
-        addKpiCard(
-                row2,
-                "COLABORADOR",
-                currencyFmt.format(s.collaboratorShare()),
-                "Comissão motoboys",
-                BLUE_BOX_BG,
-                BLUE_BORDER,
-                BLUE_TEXT,
-                BLUE_TEXT,
-                SLATE_500
-        );
-        addSpacerCell(row2);
-        addKpiCard(
-                row2,
-                "REGISTROS",
-                String.valueOf(s.totalOrders()),
-                String.format("%d pagos • %d pendentes", s.paidOrdersCount(), s.pendingOrdersCount()),
-                ZEBRA_BG,
-                BORDER_LIGHT,
-                SLATE_700,
-                AMBER_TEXT,
-                SLATE_500
-        );
-        document.add(row2);
+        document.add(buildTable(new float[]{2.3f, 1.45f, 1.05f, 1.1f, 1.4f, 1.5f}, 18f, aggTable -> {
+            addNavyHeaderCell(aggTable, "MOTOBOY", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, Color.WHITE), Element.ALIGN_LEFT);
+            addNavyHeaderCell(aggTable, "VÍNCULO", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, Color.WHITE), Element.ALIGN_CENTER);
+            addNavyHeaderCell(aggTable, "QTD. PEDIDOS", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, Color.WHITE), Element.ALIGN_CENTER);
+            addNavyHeaderCell(aggTable, "KM TOTAL", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, Color.WHITE), Element.ALIGN_RIGHT);
+            addNavyHeaderCell(aggTable, "VALOR BRUTO", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, Color.WHITE), Element.ALIGN_RIGHT);
+            addNavyHeaderCell(aggTable, "VALOR A PAGAR", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, Color.WHITE), Element.ALIGN_RIGHT);
 
-        // Motoboy Aggregate Table (Valores a Pagar no Dia)
-        final Paragraph aggTitle = new Paragraph("AGREGADO POR MOTOBOY (VALORES A PAGAR NO DIA)", sectionFont);
-        aggTitle.setSpacingAfter(7f);
-        document.add(aggTitle);
+            Optional.ofNullable(s.motoboyAggregates())
+                    .ifPresent(list -> IntStream.range(0, list.size())
+                            .forEach(idx -> addMotoboyAggregateRow(aggTable, list.get(idx), idx % 2 == 0 ? Color.WHITE : ZEBRA_BG)));
 
-        // Generous column widths so "TERCEIRIZADO" fits on a single line cleanly
-        final PdfPTable aggTable = new PdfPTable(new float[]{2.3f, 1.45f, 1.05f, 1.1f, 1.4f, 1.5f});
-        aggTable.setWidthPercentage(100);
-        aggTable.setSpacingAfter(18f);
+            aggTable.addCell(buildCell(
+                    new Phrase("VALOR FINAL DE TODOS OS MOTOBOYS JUNTOS NO DIA", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, GREEN_TEXT)),
+                    cell -> {
+                        cell.setColspan(2);
+                        cell.setBackgroundColor(GREEN_BOX_BG);
+                        cell.setBorderColor(GREEN_BORDER);
+                        cell.setPadding(8f);
+                    }
+            ));
 
-        final Font thFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, Color.WHITE);
-        final Font tdFont = FontFactory.getFont(FontFactory.HELVETICA, 8.5f, SLATE_900);
-        final Font tdBoldFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, SLATE_900);
-        final Font greenValFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, GREEN_TEXT);
-        final Font totalLblFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, GREEN_TEXT);
-        final Font totalValFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 9.5f, GREEN_TEXT);
+            addStyledBodyCell(aggTable, String.valueOf(s.totalOrders()), FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, GREEN_TEXT), GREEN_BOX_BG, Element.ALIGN_CENTER);
+            addStyledBodyCell(aggTable, "-", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, GREEN_TEXT), GREEN_BOX_BG, Element.ALIGN_RIGHT);
+            addStyledBodyCell(aggTable, formatCurrency(s.totalRevenue()), FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, GREEN_TEXT), GREEN_BOX_BG, Element.ALIGN_RIGHT);
+            addStyledBodyCell(aggTable, formatCurrency(s.totalMotoboysAmountToPay()), FontFactory.getFont(FontFactory.HELVETICA_BOLD, 9.5f, GREEN_TEXT), GREEN_BOX_BG, Element.ALIGN_RIGHT);
+        }));
+    }
 
-        addNavyHeaderCell(aggTable, "MOTOBOY", thFont, Element.ALIGN_LEFT);
-        addNavyHeaderCell(aggTable, "VÍNCULO", thFont, Element.ALIGN_CENTER);
-        addNavyHeaderCell(aggTable, "QTD. PEDIDOS", thFont, Element.ALIGN_CENTER);
-        addNavyHeaderCell(aggTable, "KM TOTAL", thFont, Element.ALIGN_RIGHT);
-        addNavyHeaderCell(aggTable, "VALOR BRUTO", thFont, Element.ALIGN_RIGHT);
-        addNavyHeaderCell(aggTable, "VALOR A PAGAR", thFont, Element.ALIGN_RIGHT);
-
-        if (s.motoboyAggregates() != null) {
-            int idx = 0;
-            for (final MotoboyReportAggregateDTO agg : s.motoboyAggregates()) {
-                final Color rowBg = (idx % 2 == 0) ? Color.WHITE : ZEBRA_BG;
-                addStyledBodyCell(aggTable, agg.motoboyName(), tdBoldFont, rowBg, Element.ALIGN_LEFT);
-                addStyledBodyCell(aggTable, agg.motoboyType(), tdFont, rowBg, Element.ALIGN_CENTER);
-                addStyledBodyCell(aggTable, String.valueOf(agg.totalOrders()), tdBoldFont, rowBg, Element.ALIGN_CENTER);
-                addStyledBodyCell(aggTable, String.format(PT_BR, "%.1f km", agg.totalDistanceKm()), tdFont, rowBg, Element.ALIGN_RIGHT);
-                addStyledBodyCell(aggTable, currencyFmt.format(agg.grossAmount()), tdFont, rowBg, Element.ALIGN_RIGHT);
-                addStyledBodyCell(aggTable, currencyFmt.format(agg.amountToPay()), greenValFont, rowBg, Element.ALIGN_RIGHT);
-                idx++;
-            }
-        }
-
-        // Footer Total Row with colspan = 2 for "VALOR FINAL DE TODOS OS MOTOBOYS JUNTOS NO DIA"
-        final PdfPCell totalTitleCell = new PdfPCell(new Phrase("VALOR FINAL DE TODOS OS MOTOBOYS JUNTOS NO DIA", totalLblFont));
-        totalTitleCell.setColspan(2);
-        totalTitleCell.setBackgroundColor(GREEN_BOX_BG);
-        totalTitleCell.setBorderColor(GREEN_BORDER);
-        totalTitleCell.setPadding(8f);
-        aggTable.addCell(totalTitleCell);
-
-        addStyledBodyCell(aggTable, String.valueOf(s.totalOrders()), totalLblFont, GREEN_BOX_BG, Element.ALIGN_CENTER);
-        addStyledBodyCell(aggTable, "-", totalLblFont, GREEN_BOX_BG, Element.ALIGN_RIGHT);
-        addStyledBodyCell(aggTable, currencyFmt.format(s.totalRevenue()), totalLblFont, GREEN_BOX_BG, Element.ALIGN_RIGHT);
-        addStyledBodyCell(aggTable, currencyFmt.format(s.totalMotoboysAmountToPay()), totalValFont, GREEN_BOX_BG, Element.ALIGN_RIGHT);
-
-        document.add(aggTable);
+    private void addMotoboyAggregateRow(PdfPTable aggTable, MotoboyReportAggregateDTO agg, Color rowBg) {
+        addStyledBodyCell(aggTable, agg.motoboyName(), FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, SLATE_900), rowBg, Element.ALIGN_LEFT);
+        addStyledBodyCell(aggTable, agg.motoboyType(), FontFactory.getFont(FontFactory.HELVETICA, 8.5f, SLATE_900), rowBg, Element.ALIGN_CENTER);
+        addStyledBodyCell(aggTable, String.valueOf(agg.totalOrders()), FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, SLATE_900), rowBg, Element.ALIGN_CENTER);
+        addStyledBodyCell(aggTable, String.format(PT_BR, "%.1f km", agg.totalDistanceKm()), FontFactory.getFont(FontFactory.HELVETICA, 8.5f, SLATE_900), rowBg, Element.ALIGN_RIGHT);
+        addStyledBodyCell(aggTable, formatCurrency(agg.grossAmount()), FontFactory.getFont(FontFactory.HELVETICA, 8.5f, SLATE_900), rowBg, Element.ALIGN_RIGHT);
+        addStyledBodyCell(aggTable, formatCurrency(agg.amountToPay()), FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, GREEN_TEXT), rowBg, Element.ALIGN_RIGHT);
     }
 
     private void addKpiCard(
@@ -431,272 +377,209 @@ public class PdfExportService {
             Color valueColor,
             Color subtitleColor
     ) {
-        final Font titleFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 7.5f, titleColor);
-        final Font valueFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 11.5f, valueColor);
-        final Font subFont = FontFactory.getFont(FontFactory.HELVETICA, 7.2f, subtitleColor);
-
-        final Paragraph p = new Paragraph();
-        p.setLeading(13.5f);
-        p.add(new Phrase(title + "\n", titleFont));
-        p.add(new Phrase(mainValue + "\n", valueFont));
-        p.add(new Phrase(subtitle, subFont));
-
-        final PdfPCell cell = new PdfPCell(p);
-        cell.setBackgroundColor(bgColor);
-        cell.setBorderColor(borderColor);
-        cell.setBorderWidth(1f);
-        cell.setPadding(9.5f);
-        grid.addCell(cell);
+        grid.addCell(buildCell(
+                buildParagraph(13.5f, p -> {
+                    p.add(new Phrase(title + "\n", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 7.5f, titleColor)));
+                    p.add(new Phrase(mainValue + "\n", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 11.5f, valueColor)));
+                    p.add(new Phrase(subtitle, FontFactory.getFont(FontFactory.HELVETICA, 7.2f, subtitleColor)));
+                }),
+                cell -> {
+                    cell.setBackgroundColor(bgColor);
+                    cell.setBorderColor(borderColor);
+                    cell.setBorderWidth(1f);
+                    cell.setPadding(9.5f);
+                }
+        ));
     }
 
     private void addEntityUsernameSection(Document document, ReportResponseDTO report) throws Exception {
-        final Font sectionFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 9.5f, NAVY_BG);
-        final String headerLabel = report.type() == ReportType.MOTOBOY ? "IDENTIFICAÇÃO DO ENTREGADOR" : "IDENTIFICAÇÃO DO CLIENTE";
-        final Paragraph title = new Paragraph(headerLabel, sectionFont);
-        title.setSpacingAfter(6f);
-        document.add(title);
-
-        final PdfPTable table = new PdfPTable(new float[]{2.5f, 1f});
-        table.setWidthPercentage(100);
-        table.setSpacingAfter(16f);
-
-        final Font thFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, Color.WHITE);
-        final Font tdFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 9f, SLATE_900);
-
-        addNavyHeaderCell(table, "NOME / ESTABELECIMENTO", thFont, Element.ALIGN_LEFT);
-        addNavyHeaderCell(table, "MODALIDADE / VÍNCULO", thFont, Element.ALIGN_CENTER);
-
-        addStyledBodyCell(table, report.targetEntityName() != null ? report.targetEntityName() : "-", tdFont, Color.WHITE, Element.ALIGN_LEFT);
-        addStyledBodyCell(table, report.targetEntitySubtype() != null ? report.targetEntitySubtype() : "-", tdFont, Color.WHITE, Element.ALIGN_CENTER);
-
-        document.add(table);
+        document.add(buildSectionTitle(
+                report.type() == ReportType.MOTOBOY ? "IDENTIFICAÇÃO DO ENTREGADOR" : "IDENTIFICAÇÃO DO CLIENTE",
+                6f
+        ));
+        document.add(buildTable(new float[]{2.5f, 1f}, 16f, table -> {
+            addNavyHeaderCell(table, "NOME / ESTABELECIMENTO", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, Color.WHITE), Element.ALIGN_LEFT);
+            addNavyHeaderCell(table, "MODALIDADE / VÍNCULO", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, Color.WHITE), Element.ALIGN_CENTER);
+            addStyledBodyCell(table, report.targetEntityName() != null ? report.targetEntityName() : "-", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 9f, SLATE_900), Color.WHITE, Element.ALIGN_LEFT);
+            addStyledBodyCell(table, report.targetEntitySubtype() != null ? report.targetEntitySubtype() : "-", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 9f, SLATE_900), Color.WHITE, Element.ALIGN_CENTER);
+        }));
     }
 
-    private void addOrdersGroupedByDateSection(
-            Document document,
-            List<OrderResponseDTO> orders,
-            NumberFormat currencyFmt
-    ) throws Exception {
-        final Font sectionFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 9.5f, NAVY_BG);
-        final Paragraph title = new Paragraph(String.format("DETALHAMENTO DE PEDIDOS (%d)", orders.size()), sectionFont);
-        title.setSpacingAfter(7f);
-        document.add(title);
+    private void addOrdersGroupedByDateSection(Document document, List<OrderResponseDTO> orders) throws Exception {
+        document.add(buildSectionTitle(String.format("DETALHAMENTO DE PEDIDOS (%d)", orders.size()), 7f));
 
-        final Map<String, List<OrderResponseDTO>> groupedByDate = orders.stream()
+        groupOrdersByDate(orders).forEach((dateKey, dayOrders) -> Try.run(() -> {
+            document.add(buildTable(new float[]{1f, 1f}, 0f, groupBar -> {
+                groupBar.addCell(buildCell(
+                        new Phrase("■  " + dateKey, FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, NAVY_BG)),
+                        cell -> {
+                            cell.setBackgroundColor(SLATE_HEADER_BG);
+                            cell.setBorderColor(BORDER_LIGHT);
+                            cell.setPadding(6.5f);
+                        }
+                ));
+                groupBar.addCell(buildCell(
+                        configureElement(new Phrase(), phrase -> {
+                            phrase.add(new Phrase(
+                                    String.format("%d %s • Subtotal: ", dayOrders.size(), dayOrders.size() == 1 ? "registro" : "registros"),
+                                    FontFactory.getFont(FontFactory.HELVETICA, 8f, SLATE_700)
+                            ));
+                            phrase.add(new Phrase(
+                                    formatCurrency(sumOrdersRevenue(dayOrders)),
+                                    FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, GREEN_TEXT)
+                            ));
+                        }),
+                        cell -> {
+                            cell.setBackgroundColor(SLATE_HEADER_BG);
+                            cell.setBorderColor(BORDER_LIGHT);
+                            cell.setHorizontalAlignment(Element.ALIGN_RIGHT);
+                            cell.setPadding(6.5f);
+                        }
+                ));
+            }));
+
+            document.add(buildTable(new float[]{1.6f, 1.3f, 3.4f, 1.2f}, 10f, dayTable -> {
+                addTableHeaderCell(dayTable, "CLIENTE", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, NAVY_BG), Element.ALIGN_LEFT);
+                addTableHeaderCell(dayTable, "SOLICITANTE", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, NAVY_BG), Element.ALIGN_LEFT);
+                addTableHeaderCell(dayTable, "ENDEREÇO DE ENTREGA", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, NAVY_BG), Element.ALIGN_LEFT);
+                addTableHeaderCell(dayTable, "VALOR CORRIDA", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, NAVY_BG), Element.ALIGN_RIGHT);
+
+                IntStream.range(0, dayOrders.size())
+                        .forEach(rowIdx -> addOrderRow(dayTable, dayOrders.get(rowIdx), rowIdx % 2 == 0 ? Color.WHITE : ZEBRA_BG));
+            }));
+        }));
+
+        document.add(buildTable(new float[]{2f, 1f}, 16f, totalBar -> {
+            totalBar.addCell(buildCell(
+                    new Phrase("TOTAL GERAL POR PERÍODO", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 9f, NAVY_BG)),
+                    cell -> {
+                        cell.setBackgroundColor(AMBER_BG);
+                        cell.setBorderColor(AMBER_BORDER);
+                        cell.setPadding(9f);
+                    }
+            ));
+            totalBar.addCell(buildCell(
+                    new Phrase(formatCurrency(sumOrdersRevenue(orders)), FontFactory.getFont(FontFactory.HELVETICA_BOLD, 11f, GREEN_TEXT)),
+                    cell -> {
+                        cell.setBackgroundColor(AMBER_BG);
+                        cell.setBorderColor(AMBER_BORDER);
+                        cell.setHorizontalAlignment(Element.ALIGN_RIGHT);
+                        cell.setPadding(9f);
+                    }
+            ));
+        }));
+    }
+
+    private Map<String, List<OrderResponseDTO>> groupOrdersByDate(List<OrderResponseDTO> orders) {
+        return orders.stream()
                 .collect(Collectors.groupingBy(
                         o -> o.createdAt() != null ? DATE_FMT.format(o.createdAt()) : "Sem Data",
                         LinkedHashMap::new,
                         Collectors.toList()
                 ));
+    }
 
-        final Font dateFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, NAVY_BG);
-        final Font subtotalLblFont = FontFactory.getFont(FontFactory.HELVETICA, 8f, SLATE_700);
-        final Font subtotalValFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, GREEN_TEXT);
-        final Font thFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, NAVY_BG);
-        final Font tdFont = FontFactory.getFont(FontFactory.HELVETICA, 8f, SLATE_700);
-        final Font tdBoldFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, SLATE_900);
+    private void addOrderRow(PdfPTable dayTable, OrderResponseDTO order, Color rowBg) {
+        addStyledBodyCell(dayTable, order.clientName() != null ? order.clientName() : "-", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, SLATE_900), rowBg, Element.ALIGN_LEFT);
+        addStyledBodyCell(dayTable, resolveRequesterLabel(order), FontFactory.getFont(FontFactory.HELVETICA, 8f, SLATE_700), rowBg, Element.ALIGN_LEFT);
+        addStyledBodyCell(dayTable, resolveDestinationLabel(order), FontFactory.getFont(FontFactory.HELVETICA, 8f, SLATE_700), rowBg, Element.ALIGN_LEFT);
+        addStyledBodyCell(dayTable, formatCurrency(order.amount()), FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, SLATE_900), rowBg, Element.ALIGN_RIGHT);
+    }
 
-        groupedByDate.forEach((dateKey, dayOrders) -> Try.run(() -> {
-            final BigDecimal daySubtotal = dayOrders.stream()
-                    .map(OrderResponseDTO::amount)
-                    .filter(Objects::nonNull)
-                    .reduce(BigDecimal.ZERO, BigDecimal::add);
+    private String resolveRequesterLabel(OrderResponseDTO order) {
+        return (order.requesterName() != null && !order.requesterName().isBlank())
+                ? order.requesterName()
+                : (order.createdByUserName() != null ? order.createdByUserName() : "-");
+    }
 
-            // Date group bar
-            final PdfPTable groupBar = new PdfPTable(new float[]{1f, 1f});
-            groupBar.setWidthPercentage(100);
-
-            final PdfPCell leftDateCell = new PdfPCell(new Phrase("■  " + dateKey, dateFont));
-            leftDateCell.setBackgroundColor(SLATE_HEADER_BG);
-            leftDateCell.setBorderColor(BORDER_LIGHT);
-            leftDateCell.setPadding(6.5f);
-            groupBar.addCell(leftDateCell);
-
-            final Phrase rightSubtotalPhrase = new Phrase();
-            rightSubtotalPhrase.add(new Phrase(
-                    String.format("%d %s • Subtotal: ", dayOrders.size(), dayOrders.size() == 1 ? "registro" : "registros"),
-                    subtotalLblFont
-            ));
-            rightSubtotalPhrase.add(new Phrase(currencyFmt.format(daySubtotal), subtotalValFont));
-
-            final PdfPCell rightSubtotalCell = new PdfPCell(rightSubtotalPhrase);
-            rightSubtotalCell.setBackgroundColor(SLATE_HEADER_BG);
-            rightSubtotalCell.setBorderColor(BORDER_LIGHT);
-            rightSubtotalCell.setHorizontalAlignment(Element.ALIGN_RIGHT);
-            rightSubtotalCell.setPadding(6.5f);
-            groupBar.addCell(rightSubtotalCell);
-
-            document.add(groupBar);
-
-            // Orders table for that day
-            final PdfPTable dayTable = new PdfPTable(new float[]{1.6f, 1.3f, 3.4f, 1.2f});
-            dayTable.setWidthPercentage(100);
-            dayTable.setSpacingAfter(10f);
-
-            addTableHeaderCell(dayTable, "CLIENTE", thFont, Element.ALIGN_LEFT);
-            addTableHeaderCell(dayTable, "SOLICITANTE", thFont, Element.ALIGN_LEFT);
-            addTableHeaderCell(dayTable, "ENDEREÇO DE ENTREGA", thFont, Element.ALIGN_LEFT);
-            addTableHeaderCell(dayTable, "VALOR CORRIDA", thFont, Element.ALIGN_RIGHT);
-
-            int rowIdx = 0;
-            for (final OrderResponseDTO order : dayOrders) {
-                final Color rowBg = (rowIdx % 2 == 0) ? Color.WHITE : ZEBRA_BG;
-                final String addr = order.destinationAddress() != null
-                        ? String.format("%s, %s %s",
+    private String resolveDestinationLabel(OrderResponseDTO order) {
+        return order.destinationAddress() != null
+                ? String.format(
+                        "%s, %s %s",
                         order.destinationAddress().street(),
                         order.destinationAddress().number(),
-                        order.destinationAddress().neighborhood() != null ? "- " + order.destinationAddress().neighborhood() : "")
-                        : "-";
-                final String requester = (order.requesterName() != null && !order.requesterName().isBlank())
-                        ? order.requesterName()
-                        : (order.createdByUserName() != null ? order.createdByUserName() : "-");
+                        order.destinationAddress().neighborhood() != null ? "- " + order.destinationAddress().neighborhood() : ""
+                ).trim()
+                : "-";
+    }
 
-                addStyledBodyCell(dayTable, order.clientName() != null ? order.clientName() : "-", tdBoldFont, rowBg, Element.ALIGN_LEFT);
-                addStyledBodyCell(dayTable, requester, tdFont, rowBg, Element.ALIGN_LEFT);
-                addStyledBodyCell(dayTable, addr.trim(), tdFont, rowBg, Element.ALIGN_LEFT);
-                addStyledBodyCell(dayTable, currencyFmt.format(order.amount() != null ? order.amount() : BigDecimal.ZERO), tdBoldFont, rowBg, Element.ALIGN_RIGHT);
-                rowIdx++;
-            }
-
-            document.add(dayTable);
-        }));
-
-        final BigDecimal grandTotal = orders.stream()
+    private BigDecimal sumOrdersRevenue(List<OrderResponseDTO> orders) {
+        return orders.stream()
                 .map(OrderResponseDTO::amount)
                 .filter(Objects::nonNull)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
+    }
 
-        // Yellow Highlight Box: TOTAL GERAL POR PERÍODO
-        final PdfPTable totalBar = new PdfPTable(new float[]{2f, 1f});
-        totalBar.setWidthPercentage(100);
-        totalBar.setSpacingAfter(16f);
-
-        final Font totalLblFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 9f, NAVY_BG);
-        final Font totalValFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 11f, GREEN_TEXT);
-
-        final PdfPCell lblCell = new PdfPCell(new Phrase("TOTAL GERAL POR PERÍODO", totalLblFont));
-        lblCell.setBackgroundColor(AMBER_BG);
-        lblCell.setBorderColor(AMBER_BORDER);
-        lblCell.setPadding(9f);
-        totalBar.addCell(lblCell);
-
-        final PdfPCell valCell = new PdfPCell(new Phrase(currencyFmt.format(grandTotal), totalValFont));
-        valCell.setBackgroundColor(AMBER_BG);
-        valCell.setBorderColor(AMBER_BORDER);
-        valCell.setHorizontalAlignment(Element.ALIGN_RIGHT);
-        valCell.setPadding(9f);
-        totalBar.addCell(valCell);
-
-        document.add(totalBar);
+    private BigDecimal sumOrdersMotoboyShare(List<OrderResponseDTO> orders) {
+        return orders.stream()
+                .map(OrderResponseDTO::motoboyCommissionAmount)
+                .filter(Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
     }
 
     private void addSummarySection(
             Document document,
             ReportResponseDTO report,
             List<OrderResponseDTO> orders,
-            NumberFormat currencyFmt,
             double motoboyPct
     ) throws Exception {
-        final double rdoPct = Math.max(0.0, 100.0 - motoboyPct);
-        final String motoboyPctLabel = formatPercentage(motoboyPct);
-        final String rdoPctLabel = formatPercentage(rdoPct);
-        final boolean isMotoboyReport = report.type() == ReportType.MOTOBOY;
-
-        final Font sectionFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 9.5f, NAVY_BG);
-        final Paragraph title = new Paragraph(
-                isMotoboyReport ? "RESUMO FINANCEIRO POR MOTOBOY" : "RESUMO FINANCEIRO POR CLIENTE",
-                sectionFont
-        );
-        title.setSpacingAfter(7f);
-        document.add(title);
-
-        // Blue Rule Explanation Box
-        final PdfPTable ruleBox = new PdfPTable(1);
-        ruleBox.setWidthPercentage(100);
-        ruleBox.setSpacingAfter(12f);
-
-        final Font ruleFont = FontFactory.getFont(FontFactory.HELVETICA, 8f, new Color(30, 58, 138));
-        final PdfPCell ruleCell = new PdfPCell(new Phrase(
-                String.format(
-                        "Regra de divisão da corrida: do valor total de cada corrida, %s é destinado ao motoboy e %s é retido pela RDO (empresa). O \"Valor Total Receita\" representa a soma bruta das corridas; \"Valor Motoboy\" e \"Valor RDO\" são os valores já calculados conforme essa divisão.",
-                        motoboyPctLabel,
-                        rdoPctLabel
-                ),
-                ruleFont
+        document.add(buildSectionTitle(
+                report.type() == ReportType.MOTOBOY ? "RESUMO FINANCEIRO POR MOTOBOY" : "RESUMO FINANCEIRO POR CLIENTE",
+                7f
         ));
-        ruleCell.setBackgroundColor(BLUE_BOX_BG);
-        ruleCell.setBorderColor(BLUE_BORDER);
-        ruleCell.setPadding(9f);
-        ruleBox.addCell(ruleCell);
-        document.add(ruleBox);
 
-        final BigDecimal totalRevenue = orders.stream()
-                .map(OrderResponseDTO::amount)
-                .filter(Objects::nonNull)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        document.add(buildTable(new float[]{1f}, 12f, ruleBox ->
+                ruleBox.addCell(buildCell(
+                        new Phrase(
+                                String.format(
+                                        "Regra de divisão da corrida: do valor total de cada corrida, %s é destinado ao motoboy e %s é retido pela RDO (empresa). O \"Valor Total Receita\" representa a soma bruta das corridas; \"Valor Motoboy\" e \"Valor RDO\" são os valores já calculados conforme essa divisão.",
+                                        formatPercentage(motoboyPct),
+                                        formatPercentage(Math.max(0.0, 100.0 - motoboyPct))
+                                ),
+                                FontFactory.getFont(FontFactory.HELVETICA, 8f, new Color(30, 58, 138))
+                        ),
+                        cell -> {
+                            cell.setBackgroundColor(BLUE_BOX_BG);
+                            cell.setBorderColor(BLUE_BORDER);
+                            cell.setPadding(9f);
+                        }
+                ))
+        ));
 
-        final BigDecimal totalMotoboy = orders.stream()
-                .map(OrderResponseDTO::motoboyCommissionAmount)
-                .filter(Objects::nonNull)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        document.add(buildTable(new float[]{1.9f, 1.1f, 1.5f, 1.6f, 1.5f, 1.5f}, 14f, summaryTable -> {
+            addNavyHeaderCell(summaryTable, report.type() == ReportType.MOTOBOY ? "MOTOBOY" : "CLIENTE", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, Color.WHITE), Element.ALIGN_LEFT);
+            addNavyHeaderCell(summaryTable, "QTD. CORRIDAS", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, Color.WHITE), Element.ALIGN_CENTER);
+            addNavyHeaderCell(summaryTable, "RECEITA BRUTA", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, Color.WHITE), Element.ALIGN_RIGHT);
+            addNavyHeaderCell(summaryTable, "MOTOBOY (" + formatPercentage(motoboyPct) + ")", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, Color.WHITE), Element.ALIGN_RIGHT);
+            addNavyHeaderCell(summaryTable, "RDO (" + formatPercentage(Math.max(0.0, 100.0 - motoboyPct)) + ")", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, Color.WHITE), Element.ALIGN_RIGHT);
+            addNavyHeaderCell(summaryTable, "TOTAL CALCULADO", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, Color.WHITE), Element.ALIGN_RIGHT);
 
-        final BigDecimal totalRdo = totalRevenue.subtract(totalMotoboy);
+            addStyledBodyCell(summaryTable, report.targetEntityName() != null ? report.targetEntityName() : "-", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, NAVY_BG), Color.WHITE, Element.ALIGN_LEFT);
+            addStyledBodyCell(summaryTable, String.valueOf(orders.size()), FontFactory.getFont(FontFactory.HELVETICA, 8.5f, NAVY_BG), Color.WHITE, Element.ALIGN_CENTER);
+            addStyledBodyCell(summaryTable, formatCurrency(sumOrdersRevenue(orders)), FontFactory.getFont(FontFactory.HELVETICA, 8.5f, NAVY_BG), Color.WHITE, Element.ALIGN_RIGHT);
+            addStyledBodyCell(summaryTable, formatCurrency(sumOrdersMotoboyShare(orders)), FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, GREEN_TEXT), Color.WHITE, Element.ALIGN_RIGHT);
+            addStyledBodyCell(summaryTable, formatCurrency(sumOrdersRevenue(orders).subtract(sumOrdersMotoboyShare(orders))), FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, BLUE_TEXT), Color.WHITE, Element.ALIGN_RIGHT);
+            addStyledBodyCell(summaryTable, formatCurrency(sumOrdersRevenue(orders)), FontFactory.getFont(FontFactory.HELVETICA, 8.5f, NAVY_BG), Color.WHITE, Element.ALIGN_RIGHT);
 
-        // Summary Table (6 columns)
-        final PdfPTable summaryTable = new PdfPTable(new float[]{1.9f, 1.1f, 1.5f, 1.6f, 1.5f, 1.5f});
-        summaryTable.setWidthPercentage(100);
-        summaryTable.setSpacingAfter(14f);
+            addStyledBodyCell(summaryTable, "TOTAL GERAL", FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, NAVY_BG), SLATE_HEADER_BG, Element.ALIGN_LEFT);
+            addStyledBodyCell(summaryTable, String.valueOf(orders.size()), FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, NAVY_BG), SLATE_HEADER_BG, Element.ALIGN_CENTER);
+            addStyledBodyCell(summaryTable, formatCurrency(sumOrdersRevenue(orders)), FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, NAVY_BG), SLATE_HEADER_BG, Element.ALIGN_RIGHT);
+            addStyledBodyCell(summaryTable, formatCurrency(sumOrdersMotoboyShare(orders)), FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, GREEN_TEXT), SLATE_HEADER_BG, Element.ALIGN_RIGHT);
+            addStyledBodyCell(summaryTable, formatCurrency(sumOrdersRevenue(orders).subtract(sumOrdersMotoboyShare(orders))), FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, BLUE_TEXT), SLATE_HEADER_BG, Element.ALIGN_RIGHT);
+            addStyledBodyCell(summaryTable, formatCurrency(sumOrdersRevenue(orders)), FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, NAVY_BG), SLATE_HEADER_BG, Element.ALIGN_RIGHT);
+        }));
 
-        final Font thFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, Color.WHITE);
-        final Font tdFont = FontFactory.getFont(FontFactory.HELVETICA, 8.5f, NAVY_BG);
-        final Font tdBoldFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, NAVY_BG);
-        final Font greenFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, GREEN_TEXT);
-        final Font blueFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8.5f, BLUE_TEXT);
+        document.add(buildTable(new float[]{1f, 0.04f, 1f}, 10f, greenSplitGrid -> {
+            addHighlightSplitBox(greenSplitGrid, "VALOR MOTOBOY (" + formatPercentage(motoboyPct) + ")", formatCurrency(sumOrdersMotoboyShare(orders)), GREEN_BOX_BG, GREEN_TEXT, GREEN_BORDER);
+            addSpacerCell(greenSplitGrid);
+            addHighlightSplitBox(greenSplitGrid, "VALOR RDO (" + formatPercentage(Math.max(0.0, 100.0 - motoboyPct)) + ")", formatCurrency(sumOrdersRevenue(orders).subtract(sumOrdersMotoboyShare(orders))), BLUE_BOX_BG, BLUE_TEXT, BLUE_BORDER);
+        }));
 
-        addNavyHeaderCell(summaryTable, isMotoboyReport ? "MOTOBOY" : "CLIENTE", thFont, Element.ALIGN_LEFT);
-        addNavyHeaderCell(summaryTable, "QTD. CORRIDAS", thFont, Element.ALIGN_CENTER);
-        addNavyHeaderCell(summaryTable, "RECEITA BRUTA", thFont, Element.ALIGN_RIGHT);
-        addNavyHeaderCell(summaryTable, "MOTOBOY (" + motoboyPctLabel + ")", thFont, Element.ALIGN_RIGHT);
-        addNavyHeaderCell(summaryTable, "RDO (" + rdoPctLabel + ")", thFont, Element.ALIGN_RIGHT);
-        addNavyHeaderCell(summaryTable, "TOTAL CALCULADO", thFont, Element.ALIGN_RIGHT);
-
-        final String entityName = report.targetEntityName() != null ? report.targetEntityName() : "-";
-        addStyledBodyCell(summaryTable, entityName, tdBoldFont, Color.WHITE, Element.ALIGN_LEFT);
-        addStyledBodyCell(summaryTable, String.valueOf(orders.size()), tdFont, Color.WHITE, Element.ALIGN_CENTER);
-        addStyledBodyCell(summaryTable, currencyFmt.format(totalRevenue), tdFont, Color.WHITE, Element.ALIGN_RIGHT);
-        addStyledBodyCell(summaryTable, currencyFmt.format(totalMotoboy), greenFont, Color.WHITE, Element.ALIGN_RIGHT);
-        addStyledBodyCell(summaryTable, currencyFmt.format(totalRdo), blueFont, Color.WHITE, Element.ALIGN_RIGHT);
-        addStyledBodyCell(summaryTable, currencyFmt.format(totalRevenue), tdFont, Color.WHITE, Element.ALIGN_RIGHT);
-
-        addStyledBodyCell(summaryTable, "TOTAL GERAL", tdBoldFont, SLATE_HEADER_BG, Element.ALIGN_LEFT);
-        addStyledBodyCell(summaryTable, String.valueOf(orders.size()), tdBoldFont, SLATE_HEADER_BG, Element.ALIGN_CENTER);
-        addStyledBodyCell(summaryTable, currencyFmt.format(totalRevenue), tdBoldFont, SLATE_HEADER_BG, Element.ALIGN_RIGHT);
-        addStyledBodyCell(summaryTable, currencyFmt.format(totalMotoboy), greenFont, SLATE_HEADER_BG, Element.ALIGN_RIGHT);
-        addStyledBodyCell(summaryTable, currencyFmt.format(totalRdo), blueFont, SLATE_HEADER_BG, Element.ALIGN_RIGHT);
-        addStyledBodyCell(summaryTable, currencyFmt.format(totalRevenue), tdBoldFont, SLATE_HEADER_BG, Element.ALIGN_RIGHT);
-
-        document.add(summaryTable);
-
-        // Two Green Boxes: VALOR MOTOBOY (X%) | VALOR RDO (Y%)
-        final PdfPTable greenSplitGrid = new PdfPTable(new float[]{1f, 0.04f, 1f});
-        greenSplitGrid.setWidthPercentage(100);
-        greenSplitGrid.setSpacingAfter(10f);
-
-        addHighlightSplitBox(greenSplitGrid, "VALOR MOTOBOY (" + motoboyPctLabel + ")", currencyFmt.format(totalMotoboy), GREEN_BOX_BG, GREEN_TEXT, GREEN_BORDER);
-        addSpacerCell(greenSplitGrid);
-        addHighlightSplitBox(greenSplitGrid, "VALOR RDO (" + rdoPctLabel + ")", currencyFmt.format(totalRdo), BLUE_BOX_BG, BLUE_TEXT, BLUE_BORDER);
-
-        document.add(greenSplitGrid);
-
-        // Bottom Two Boxes: TOTAL DE REGISTROS | SOMA VALOR SERVIÇO
-        final PdfPTable bottomGrid = new PdfPTable(new float[]{1f, 0.04f, 1f});
-        bottomGrid.setWidthPercentage(100);
-
-        addHighlightSplitBox(bottomGrid, "TOTAL DE REGISTROS", String.valueOf(orders.size()), SLATE_HEADER_BG, NAVY_BG, BORDER_LIGHT);
-        addSpacerCell(bottomGrid);
-        addHighlightSplitBox(bottomGrid, "SOMA VALOR SERVIÇO", currencyFmt.format(totalRevenue), ROSE_BOX_BG, ROSE_TEXT, ROSE_BORDER);
-
-        document.add(bottomGrid);
+        document.add(buildTable(new float[]{1f, 0.04f, 1f}, 0f, bottomGrid -> {
+            addHighlightSplitBox(bottomGrid, "TOTAL DE REGISTROS", String.valueOf(orders.size()), SLATE_HEADER_BG, NAVY_BG, BORDER_LIGHT);
+            addSpacerCell(bottomGrid);
+            addHighlightSplitBox(bottomGrid, "SOMA VALOR SERVIÇO", formatCurrency(sumOrdersRevenue(orders)), ROSE_BOX_BG, ROSE_TEXT, ROSE_BORDER);
+        }));
     }
 
     private void addHighlightSplitBox(
@@ -707,59 +590,63 @@ public class PdfExportService {
             Color textColor,
             Color borderColor
     ) {
-        final PdfPTable inner = new PdfPTable(new float[]{1.3f, 1f});
-        final Font lblFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, textColor);
-        final Font valFont = FontFactory.getFont(FontFactory.HELVETICA_BOLD, 10.5f, textColor);
-
-        final PdfPCell left = new PdfPCell(new Phrase(label, lblFont));
-        left.setBorder(Rectangle.NO_BORDER);
-        left.setBackgroundColor(bg);
-        left.setVerticalAlignment(Element.ALIGN_MIDDLE);
-        left.setPadding(10f);
-        inner.addCell(left);
-
-        final PdfPCell right = new PdfPCell(new Phrase(value, valFont));
-        right.setBorder(Rectangle.NO_BORDER);
-        right.setBackgroundColor(bg);
-        right.setHorizontalAlignment(Element.ALIGN_RIGHT);
-        right.setVerticalAlignment(Element.ALIGN_MIDDLE);
-        right.setPadding(10f);
-        inner.addCell(right);
-
-        final PdfPCell wrapper = new PdfPCell(inner);
-        wrapper.setBorderColor(borderColor);
-        wrapper.setBorderWidth(1f);
-        wrapper.setBackgroundColor(bg);
-        parent.addCell(wrapper);
+        parent.addCell(buildCell(
+                buildTable(new float[]{1.3f, 1f}, 0f, inner -> {
+                    inner.addCell(buildCell(
+                            new Phrase(label, FontFactory.getFont(FontFactory.HELVETICA_BOLD, 8f, textColor)),
+                            left -> {
+                                left.setBorder(Rectangle.NO_BORDER);
+                                left.setBackgroundColor(bg);
+                                left.setVerticalAlignment(Element.ALIGN_MIDDLE);
+                                left.setPadding(10f);
+                            }
+                    ));
+                    inner.addCell(buildCell(
+                            new Phrase(value, FontFactory.getFont(FontFactory.HELVETICA_BOLD, 10.5f, textColor)),
+                            right -> {
+                                right.setBorder(Rectangle.NO_BORDER);
+                                right.setBackgroundColor(bg);
+                                right.setHorizontalAlignment(Element.ALIGN_RIGHT);
+                                right.setVerticalAlignment(Element.ALIGN_MIDDLE);
+                                right.setPadding(10f);
+                            }
+                    ));
+                }),
+                wrapper -> {
+                    wrapper.setBorderColor(borderColor);
+                    wrapper.setBorderWidth(1f);
+                    wrapper.setBackgroundColor(bg);
+                }
+        ));
     }
 
     private void addNavyHeaderCell(PdfPTable table, String text, Font font, int alignment) {
-        final PdfPCell cell = new PdfPCell(new Phrase(text, font));
-        cell.setBackgroundColor(NAVY_BG);
-        cell.setBorderColor(NAVY_BG);
-        cell.setHorizontalAlignment(alignment);
-        cell.setVerticalAlignment(Element.ALIGN_MIDDLE);
-        cell.setPadding(7.5f);
-        table.addCell(cell);
+        table.addCell(buildCell(new Phrase(text, font), cell -> {
+            cell.setBackgroundColor(NAVY_BG);
+            cell.setBorderColor(NAVY_BG);
+            cell.setHorizontalAlignment(alignment);
+            cell.setVerticalAlignment(Element.ALIGN_MIDDLE);
+            cell.setPadding(7.5f);
+        }));
     }
 
     private void addTableHeaderCell(PdfPTable table, String text, Font font, int alignment) {
-        final PdfPCell cell = new PdfPCell(new Phrase(text, font));
-        cell.setBackgroundColor(new Color(241, 245, 249));
-        cell.setBorderColor(BORDER_LIGHT);
-        cell.setHorizontalAlignment(alignment);
-        cell.setVerticalAlignment(Element.ALIGN_MIDDLE);
-        cell.setPadding(6.5f);
-        table.addCell(cell);
+        table.addCell(buildCell(new Phrase(text, font), cell -> {
+            cell.setBackgroundColor(SLATE_HEADER_BG);
+            cell.setBorderColor(BORDER_LIGHT);
+            cell.setHorizontalAlignment(alignment);
+            cell.setVerticalAlignment(Element.ALIGN_MIDDLE);
+            cell.setPadding(6.5f);
+        }));
     }
 
     private void addStyledBodyCell(PdfPTable table, String text, Font font, Color bgColor, int alignment) {
-        final PdfPCell cell = new PdfPCell(new Phrase(text, font));
-        cell.setBackgroundColor(bgColor);
-        cell.setBorderColor(BORDER_LIGHT);
-        cell.setHorizontalAlignment(alignment);
-        cell.setVerticalAlignment(Element.ALIGN_MIDDLE);
-        cell.setPadding(7f);
-        table.addCell(cell);
+        table.addCell(buildCell(new Phrase(text, font), cell -> {
+            cell.setBackgroundColor(bgColor);
+            cell.setBorderColor(BORDER_LIGHT);
+            cell.setHorizontalAlignment(alignment);
+            cell.setVerticalAlignment(Element.ALIGN_MIDDLE);
+            cell.setPadding(7f);
+        }));
     }
 }

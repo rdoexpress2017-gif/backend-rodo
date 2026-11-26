@@ -26,58 +26,39 @@ public class SettingsService {
     private final SystemSettingsMapper settingsMapper;
 
     public Mono<SystemSettingsResponseDTO> getSettings() {
-        final LocalDate today = LocalDate.now(SAO_PAULO_ZONE);
         return getOrCreateSettingsEntity()
-                .flatMap(entity -> {
-                    if (Boolean.TRUE.equals(entity.getDailyJobExecutedToday())
-                            && (entity.getLastDailyJobExecutionDate() == null
-                            || !entity.getLastDailyJobExecutionDate().equals(today))) {
-                        return settingsRepository.save(entity.toBuilder()
-                                .dailyJobExecutedToday(false)
-                                .build());
-                    }
-                    return Mono.just(entity);
-                })
+                .flatMap(entity -> Boolean.TRUE.equals(entity.getDailyJobExecutedToday())
+                        && (entity.getLastDailyJobExecutionDate() == null
+                        || !entity.getLastDailyJobExecutionDate().equals(LocalDate.now(SAO_PAULO_ZONE)))
+                        ? settingsRepository.save(entity.toBuilder().dailyJobExecutedToday(false).build())
+                        : Mono.just(entity))
                 .map(settingsMapper::toResponseDTO);
     }
 
     public Mono<SystemSettingsResponseDTO> updateSettings(SystemSettingsRequestDTO requestDTO, String userId) {
         return getOrCreateSettingsEntity()
-                .map(existing -> {
-                    final String effectiveTime = (requestDTO.dailyJobExecutionTime() != null
-                            && !requestDTO.dailyJobExecutionTime().isBlank())
-                            ? requestDTO.dailyJobExecutionTime().trim()
-                            : (existing.getDailyJobExecutionTime() != null ? existing.getDailyJobExecutionTime() : "20:00");
-                    return existing.toBuilder()
-                            .id(SystemSettings.GLOBAL_CONFIG_ID)
-                            .pricePerKm(requestDTO.pricePerKm())
-                            .baseRate(requestDTO.baseRate())
-                            .defaultMotoboyCommissionPercentage(requestDTO.defaultMotoboyCommissionPercentage())
-                            .dailyJobExecutionTime(effectiveTime)
-                            .updatedByUserId(userId)
-                            .updatedAt(Instant.now())
-                            .build();
-                })
+                .map(existing -> existing.toBuilder()
+                        .id(SystemSettings.GLOBAL_CONFIG_ID)
+                        .pricePerKm(requestDTO.pricePerKm())
+                        .baseRate(requestDTO.baseRate())
+                        .defaultMotoboyCommissionPercentage(requestDTO.defaultMotoboyCommissionPercentage())
+                        .dailyJobExecutionTime(resolveEffectiveExecutionTime(requestDTO, existing))
+                        .updatedByUserId(userId)
+                        .updatedAt(Instant.now())
+                        .build())
                 .flatMap(settingsRepository::save)
                 .map(settingsMapper::toResponseDTO);
     }
 
     public Mono<Boolean> hasDailyJobExecutedOnDate(LocalDate referenceDate) {
         return getOrCreateSettingsEntity()
-                .flatMap(entity -> {
-                    final boolean executedOnRefDate = Boolean.TRUE.equals(entity.getDailyJobExecutedToday())
-                            && (entity.getLastDailyJobExecutionDate() == null
-                            || referenceDate.equals(entity.getLastDailyJobExecutionDate()));
-                    if (Boolean.TRUE.equals(entity.getDailyJobExecutedToday())
-                            && entity.getLastDailyJobExecutionDate() != null
-                            && !referenceDate.equals(entity.getLastDailyJobExecutionDate())) {
-                        return settingsRepository.save(entity.toBuilder()
-                                        .dailyJobExecutedToday(false)
-                                        .build())
-                                .thenReturn(false);
-                    }
-                    return Mono.just(executedOnRefDate);
-                });
+                .flatMap(entity -> Boolean.TRUE.equals(entity.getDailyJobExecutedToday())
+                        && entity.getLastDailyJobExecutionDate() != null
+                        && !referenceDate.equals(entity.getLastDailyJobExecutionDate())
+                        ? settingsRepository.save(entity.toBuilder().dailyJobExecutedToday(false).build()).thenReturn(false)
+                        : Mono.just(Boolean.TRUE.equals(entity.getDailyJobExecutedToday())
+                                && (entity.getLastDailyJobExecutionDate() == null
+                                || referenceDate.equals(entity.getLastDailyJobExecutionDate()))));
     }
 
     public Mono<SystemSettingsResponseDTO> markDailyJobExecutedOnDate(LocalDate referenceDate) {
@@ -98,6 +79,12 @@ public class SettingsService {
                         .updatedAt(Instant.now())
                         .build()))
                 .then();
+    }
+
+    private String resolveEffectiveExecutionTime(SystemSettingsRequestDTO requestDTO, SystemSettings existing) {
+        return (requestDTO.dailyJobExecutionTime() != null && !requestDTO.dailyJobExecutionTime().isBlank())
+                ? requestDTO.dailyJobExecutionTime().trim()
+                : (existing.getDailyJobExecutionTime() != null ? existing.getDailyJobExecutionTime() : "20:00");
     }
 
     private Mono<SystemSettings> getOrCreateSettingsEntity() {

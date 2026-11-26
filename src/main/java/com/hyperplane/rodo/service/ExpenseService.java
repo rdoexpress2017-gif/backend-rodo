@@ -33,9 +33,11 @@ public class ExpenseService {
     private final ReactiveMongoTemplate mongoTemplate;
 
     public Flux<ExpenseResponseDTO> findAll(Instant startDate, Instant endDate) {
-        final Query query = buildPeriodQuery(startDate, endDate)
-                .with(Sort.by(Sort.Direction.DESC, "expenseDate", "createdAt"));
-        return mongoTemplate.find(query, Expense.class)
+        return mongoTemplate.find(
+                        buildPeriodQuery(startDate, endDate)
+                                .with(Sort.by(Sort.Direction.DESC, "expenseDate", "createdAt")),
+                        Expense.class
+                )
                 .map(expenseMapper::toResponseDTO);
     }
 
@@ -74,8 +76,7 @@ public class ExpenseService {
     }
 
     public Mono<BigDecimal> sumExpensesInPeriod(Instant startDate, Instant endDate) {
-        final Query query = buildPeriodQuery(startDate, endDate);
-        return mongoTemplate.find(query, Expense.class)
+        return mongoTemplate.find(buildPeriodQuery(startDate, endDate), Expense.class)
                 .map(Expense::getAmount)
                 .filter(Objects::nonNull)
                 .reduce(BigDecimal.ZERO, BigDecimal::add)
@@ -83,14 +84,12 @@ public class ExpenseService {
     }
 
     private Query buildPeriodQuery(Instant startDate, Instant endDate) {
-        final Query query = new Query();
-        if (startDate != null && endDate != null) {
-            query.addCriteria(Criteria.where("expenseDate").gte(startDate).lte(endDate));
-        } else if (startDate != null) {
-            query.addCriteria(Criteria.where("expenseDate").gte(startDate));
-        } else if (endDate != null) {
-            query.addCriteria(Criteria.where("expenseDate").lte(endDate));
-        }
-        return query;
+        return (startDate != null && endDate != null)
+                ? Query.query(Criteria.where("expenseDate").gte(startDate).lte(endDate))
+                : (startDate != null)
+                ? Query.query(Criteria.where("expenseDate").gte(startDate))
+                : (endDate != null)
+                ? Query.query(Criteria.where("expenseDate").lte(endDate))
+                : new Query();
     }
 }

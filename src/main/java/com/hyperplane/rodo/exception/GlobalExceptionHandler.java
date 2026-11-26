@@ -42,11 +42,14 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(WebExchangeBindException.class)
     public Mono<ResponseEntity<ErrorResponseDTO>> handleValidation(WebExchangeBindException ex) {
-        final String errors = ex.getFieldErrors().stream()
-                .map(err -> err.getField() + ": " + err.getDefaultMessage())
-                .collect(Collectors.joining(", "));
         return Mono.just(ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                .body(new ErrorResponseDTO(HttpStatus.BAD_REQUEST.value(), errors, Instant.now())));
+                .body(new ErrorResponseDTO(
+                        HttpStatus.BAD_REQUEST.value(),
+                        ex.getFieldErrors().stream()
+                                .map(err -> err.getField() + ": " + err.getDefaultMessage())
+                                .collect(Collectors.joining(", ")),
+                        Instant.now()
+                )));
     }
 
     @ExceptionHandler(Exception.class)

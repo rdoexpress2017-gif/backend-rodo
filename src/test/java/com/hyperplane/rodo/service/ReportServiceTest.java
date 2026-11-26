@@ -506,7 +506,10 @@ class ReportServiceTest {
                 .active(true)
                 .build();
 
-        // 1 paid order (R$ 4035.00, commission R$ 3228.00) for moto-1 + 1 unpaid order (R$ 400.00, commission R$ 320.00) for moto-2
+        // 1 paid order (R$ 4035.00, commission R$ 3228.00) for moto-1
+        // + 1 awaiting payment order (R$ 400.00, commission R$ 320.00) for moto-2
+        // + 1 collected order (R$ 200.00, commission R$ 140.00) for moto-1
+        // + 1 pending order (R$ 100.00, commission R$ 70.00) for moto-2 (PENDENTE should NOT count in Lucro Estimado!)
         final Order paidOrder = Order.builder()
                 .id("ord-paid-1")
                 .clientId("c-1")
@@ -517,8 +520,8 @@ class ReportServiceTest {
                 .status(OrderStatus.PAGO)
                 .createdAt(Instant.parse("2026-11-23T12:00:00Z"))
                 .build();
-        final Order pendingOrder = Order.builder()
-                .id("ord-pend-1")
+        final Order awaitingOrder = Order.builder()
+                .id("ord-await-1")
                 .clientId("c-1")
                 .motoboyId("moto-2")
                 .routeDistanceKm(20.0)
@@ -527,10 +530,30 @@ class ReportServiceTest {
                 .status(OrderStatus.AGUARDANDO_PAGAMENTO)
                 .createdAt(Instant.parse("2026-11-23T14:00:00Z"))
                 .build();
+        final Order collectedOrder = Order.builder()
+                .id("ord-col-1")
+                .clientId("c-1")
+                .motoboyId("moto-1")
+                .routeDistanceKm(10.0)
+                .amount(new BigDecimal("200.00"))
+                .motoboyCommissionAmount(new BigDecimal("140.00"))
+                .status(OrderStatus.COLETADO)
+                .createdAt(Instant.parse("2026-11-23T15:00:00Z"))
+                .build();
+        final Order pendenteOrder = Order.builder()
+                .id("ord-pendente-1")
+                .clientId("c-1")
+                .motoboyId("moto-2")
+                .routeDistanceKm(5.0)
+                .amount(new BigDecimal("100.00"))
+                .motoboyCommissionAmount(new BigDecimal("70.00"))
+                .status(OrderStatus.PENDENTE)
+                .createdAt(Instant.parse("2026-11-23T16:00:00Z"))
+                .build();
 
         when(clientRepository.findByActiveTrue()).thenReturn(Flux.empty());
         when(orderRepository.findByCreatedAtBetween(any(Instant.class), any(Instant.class)))
-                .thenReturn(Flux.just(paidOrder, pendingOrder));
+                .thenReturn(Flux.just(paidOrder, awaitingOrder, collectedOrder, pendenteOrder));
         when(expenseService.sumExpensesInPeriod(any(Instant.class), any(Instant.class)))
                 .thenReturn(Mono.just(new BigDecimal("330.00")));
         when(motoboyRepository.findById("moto-1")).thenReturn(Mono.just(moto1));
@@ -552,26 +575,32 @@ class ReportServiceTest {
                         return false;
                     }
                     final var s = emp.companySummary();
-                    // Receitas = 4035 + 400 = 4435.00
+                    // Receitas = 4035 + 400 + 200 + 100 = 4735.00
                     // Já Recebido = 4035.00 (1 pago)
-                    // A Receber = 400.00 (1 a receber)
-                    // Repasses = 3228 + 320 = 3548.00 (Pagos: 3228.00)
+                    // A Receber = 400 + 200 + 100 = 700.00 (3 a receber)
+                    // Repasses = 3228 + 320 + 140 + 70 = 3758.00 (Pagos: 3228.00)
                     // Despesas = 330.00
                     // Lucro (somente pagos) = 4035.00 - 3228.00 - 330.00 = 477.00
-                    // Total Motoboys a Pagar no dia = 3228.00 + 320.00 = 3548.00
-                    return s.totalRevenue().compareTo(new BigDecimal("4435.00")) == 0
+                    // Lucro Estimado (COLETADO para frente: PAGO + AGUARDANDO_PAGAMENTO + ENTREGUE + COLETADO)
+                    //   Receita elegível = 4035 + 400 + 200 = 4635.00 (exclui PENDENTE de 100.00)
+                    //   Repasse elegível = 3228 + 320 + 140 = 3688.00 (exclui PENDENTE de 70.00)
+                    //   Despesas = 330.00
+                    //   Lucro Estimado = 4635.00 - 3688.00 - 330.00 = 617.00
+                    return s.totalRevenue().compareTo(new BigDecimal("4735.00")) == 0
                             && s.paidRevenue().compareTo(new BigDecimal("4035.00")) == 0
-                            && s.pendingRevenue().compareTo(new BigDecimal("400.00")) == 0
+                            && s.pendingRevenue().compareTo(new BigDecimal("700.00")) == 0
                             && s.netProfit().compareTo(new BigDecimal("477.00")) == 0
-                            && s.totalCommissions().compareTo(new BigDecimal("3548.00")) == 0
+                            && s.estimatedProfit() != null
+                            && s.estimatedProfit().compareTo(new BigDecimal("617.00")) == 0
+                            && s.totalCommissions().compareTo(new BigDecimal("3758.00")) == 0
                             && s.paidCommissions().compareTo(new BigDecimal("3228.00")) == 0
                             && s.totalExpenses().compareTo(new BigDecimal("330.00")) == 0
-                            && s.collaboratorShare().compareTo(new BigDecimal("3548.00")) == 0
-                            && s.totalOrders() == 2L
+                            && s.collaboratorShare().compareTo(new BigDecimal("3758.00")) == 0
+                            && s.totalOrders() == 4L
                             && s.paidOrdersCount() == 1L
-                            && s.pendingOrdersCount() == 1L
+                            && s.pendingOrdersCount() == 3L
                             && s.motoboyAggregates().size() == 2
-                            && s.totalMotoboysAmountToPay().compareTo(new BigDecimal("3548.00")) == 0
+                            && s.totalMotoboysAmountToPay().compareTo(new BigDecimal("3758.00")) == 0
                             && Boolean.TRUE.equals(s.emailSentToMaster())
                             && "admin@rodo.com".equals(s.masterEmailRecipient());
                 })

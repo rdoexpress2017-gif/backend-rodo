@@ -29,7 +29,6 @@ import reactor.core.publisher.Mono;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.List;
 import java.util.stream.IntStream;
 
 @Configuration
@@ -92,151 +91,155 @@ public class DataSeederConfig {
     }
 
     private Mono<Void> seedRemainingSampleData(Instant now) {
-        final Mono<User> atendenteSeed = userRepository.findByEmail("atendente@rodo.com")
-                .switchIfEmpty(Mono.defer(() -> userRepository.save(User.builder()
-                        .name("Maria Atendente")
-                        .email("atendente@rodo.com")
-                        .passwordHash(passwordEncoder.encode("Atendente@123"))
-                        .phone("+55 31 98888-0002")
-                        .role(UserRole.ATENDENTE)
-                        .active(true)
-                        .createdAt(now)
-                        .updatedAt(now)
-                        .build())));
-
-        final Mono<SystemSettings> settingsSeed = settingsRepository.findById(SystemSettings.GLOBAL_CONFIG_ID)
-                .switchIfEmpty(Mono.defer(() -> settingsRepository.save(SystemSettings.builder()
-                        .id(SystemSettings.GLOBAL_CONFIG_ID)
-                        .pricePerKm(new BigDecimal("2.50"))
-                        .baseRate(new BigDecimal("10.00"))
-                        .defaultMotoboyCommissionPercentage(80.0)
-                        .updatedByUserId("SYSTEM_SEED")
-                        .updatedAt(now)
-                        .build())));
-
-        return Mono.when(atendenteSeed, settingsSeed)
+        return Mono.when(
+                        userRepository.findByEmail("atendente@rodo.com")
+                                .switchIfEmpty(Mono.defer(() -> userRepository.save(User.builder()
+                                        .name("Maria Atendente")
+                                        .email("atendente@rodo.com")
+                                        .passwordHash(passwordEncoder.encode("Atendente@123"))
+                                        .phone("+55 31 98888-0002")
+                                        .role(UserRole.ATENDENTE)
+                                        .active(true)
+                                        .createdAt(now)
+                                        .updatedAt(now)
+                                        .build()))),
+                        settingsRepository.findById(SystemSettings.GLOBAL_CONFIG_ID)
+                                .switchIfEmpty(Mono.defer(() -> settingsRepository.save(SystemSettings.builder()
+                                        .id(SystemSettings.GLOBAL_CONFIG_ID)
+                                        .pricePerKm(new BigDecimal("2.50"))
+                                        .baseRate(new BigDecimal("10.00"))
+                                        .defaultMotoboyCommissionPercentage(80.0)
+                                        .updatedByUserId("SYSTEM_SEED")
+                                        .updatedAt(now)
+                                        .build())))
+                )
                 .then(Mono.defer(this::seedOperationalSampleData));
     }
 
     private Mono<Void> seedOperationalSampleData() {
         return clientRepository.count()
                 .filter(count -> count == 0)
-                .flatMap(ignored -> {
-                    final Instant now = Instant.now();
-                    final Client c1 = Client.builder()
-                            .name("Farmácia DrogaRaia Savassi")
-                            .document("12.345.678/0001-90")
-                            .email("contato@drogaraia.com.br")
-                            .phone("(31) 3222-1100")
-                            .baseAddress(Address.builder()
-                                    .street("Av. do Contorno")
-                                    .number("6000")
-                                    .neighborhood("Savassi")
-                                    .city("Belo Horizonte")
-                                    .state("MG")
-                                    .zipCode("30110-042")
-                                    .build())
-                            .billingCycle(BillingCycle.builder()
-                                    .type(BillingCycleType.DAILY)
-                                    .build())
-                            .active(true)
-                            .createdAt(now)
-                            .updatedAt(now)
-                            .build();
+                .flatMap(ignored -> Mono.zip(
+                        clientRepository.save(buildSampleClientOne(Instant.now())),
+                        clientRepository.save(buildSampleClientTwo(Instant.now())),
+                        motoboyRepository.save(buildSampleMotoboyOne(Instant.now())),
+                        motoboyRepository.save(buildSampleMotoboyTwo(Instant.now())),
+                        userRepository.findByEmail("admin@rodo.com")
+                ).flatMap(tuple -> Flux.fromIterable(
+                        IntStream.rangeClosed(1, 25)
+                                .mapToObj(i -> buildSampleOrder(
+                                        i,
+                                        tuple.getT1(),
+                                        tuple.getT2(),
+                                        tuple.getT3(),
+                                        tuple.getT4(),
+                                        tuple.getT5(),
+                                        Instant.now()
+                                ))
+                                .toList()
+                ).flatMap(orderRepository::save).then()));
+    }
 
-                    final Client c2 = Client.builder()
-                            .name("Restaurante Sabor Mineiro")
-                            .document("98.765.432/0001-10")
-                            .email("financeiro@sabormineiro.com.br")
-                            .phone("(31) 3344-5566")
-                            .baseAddress(Address.builder()
-                                    .street("Rua Pedra Bonita")
-                                    .number("878")
-                                    .neighborhood("Barroca")
-                                    .city("Belo Horizonte")
-                                    .state("MG")
-                                    .zipCode("30431-030")
-                                    .build())
-                            .billingCycle(BillingCycle.builder()
-                                    .type(BillingCycleType.WEEKLY)
-                                    .startDayOfWeek(DayOfWeekEnum.SEGUNDA)
-                                    .endDayOfWeek(DayOfWeekEnum.SEXTA)
-                                    .build())
-                            .active(true)
-                            .createdAt(now)
-                            .updatedAt(now)
-                            .build();
+    private Client buildSampleClientOne(Instant now) {
+        return Client.builder()
+                .name("Farmácia DrogaRaia Savassi")
+                .document("12.345.678/0001-90")
+                .email("contato@drogaraia.com.br")
+                .phone("(31) 3222-1100")
+                .baseAddress(Address.builder()
+                        .street("Av. do Contorno")
+                        .number("6000")
+                        .neighborhood("Savassi")
+                        .city("Belo Horizonte")
+                        .state("MG")
+                        .zipCode("30110-042")
+                        .build())
+                .billingCycle(BillingCycle.builder()
+                        .type(BillingCycleType.DAILY)
+                        .build())
+                .active(true)
+                .createdAt(now)
+                .updatedAt(now)
+                .build();
+    }
 
-                    final Motoboy m1 = Motoboy.builder()
-                            .name("Carlos Eduardo Silva")
-                            .cpf("111.222.333-44")
-                            .phone("(31) 99111-2233")
-                            .type(MotoboyType.FIXO)
-                            .active(true)
-                            .createdAt(now)
-                            .updatedAt(now)
-                            .build();
+    private Client buildSampleClientTwo(Instant now) {
+        return Client.builder()
+                .name("Restaurante Sabor Mineiro")
+                .document("98.765.432/0001-10")
+                .email("financeiro@sabormineiro.com.br")
+                .phone("(31) 3344-5566")
+                .baseAddress(Address.builder()
+                        .street("Rua Pedra Bonita")
+                        .number("878")
+                        .neighborhood("Barroca")
+                        .city("Belo Horizonte")
+                        .state("MG")
+                        .zipCode("30431-030")
+                        .build())
+                .billingCycle(BillingCycle.builder()
+                        .type(BillingCycleType.WEEKLY)
+                        .startDayOfWeek(DayOfWeekEnum.SEGUNDA)
+                        .endDayOfWeek(DayOfWeekEnum.SEXTA)
+                        .build())
+                .active(true)
+                .createdAt(now)
+                .updatedAt(now)
+                .build();
+    }
 
-                    final Motoboy m2 = Motoboy.builder()
-                            .name("Marcos Vinícius Souza")
-                            .cpf("555.666.777-88")
-                            .phone("(31) 99444-5566")
-                            .type(MotoboyType.TERCEIRIZADO)
-                            .active(true)
-                            .createdAt(now)
-                            .updatedAt(now)
-                            .build();
+    private Motoboy buildSampleMotoboyOne(Instant now) {
+        return Motoboy.builder()
+                .name("Carlos Eduardo Silva")
+                .cpf("111.222.333-44")
+                .phone("(31) 99111-2233")
+                .type(MotoboyType.FIXO)
+                .active(true)
+                .createdAt(now)
+                .updatedAt(now)
+                .build();
+    }
 
-                    return Mono.zip(
-                            clientRepository.save(c1),
-                            clientRepository.save(c2),
-                            motoboyRepository.save(m1),
-                            motoboyRepository.save(m2),
-                            userRepository.findByEmail("admin@rodo.com")
-                    ).flatMap(tuple -> {
-                        final Client savedC1 = tuple.getT1();
-                        final Client savedC2 = tuple.getT2();
-                        final Motoboy savedM1 = tuple.getT3();
-                        final Motoboy savedM2 = tuple.getT4();
-                        final User master = tuple.getT5();
+    private Motoboy buildSampleMotoboyTwo(Instant now) {
+        return Motoboy.builder()
+                .name("Marcos Vinícius Souza")
+                .cpf("555.666.777-88")
+                .phone("(31) 99444-5566")
+                .type(MotoboyType.TERCEIRIZADO)
+                .active(true)
+                .createdAt(now)
+                .updatedAt(now)
+                .build();
+    }
 
-                        final List<Order> sampleOrders = IntStream.rangeClosed(1, 25)
-                                .mapToObj(i -> {
-                                    final boolean even = i % 2 == 0;
-                                    final OrderStatus st = i <= 8 ? OrderStatus.ENTREGUE : (i <= 15 ? OrderStatus.COLETADO : OrderStatus.PENDENTE);
-                                    final BigDecimal val = even ? new BigDecimal("35.00") : new BigDecimal("25.00");
-                                    final BigDecimal comm = even ? new BigDecimal("28.00") : new BigDecimal("20.00");
-                                    return Order.builder()
-                                            .orderNumber(1000L + i)
-                                            .clientId(even ? savedC2.getId() : savedC1.getId())
-                                            .motoboyId(even ? savedM2.getId() : savedM1.getId())
-                                            .requesterName(even ? "MARIANA" : "A. Junqueira")
-                                            .createdByUserId(master.getId())
-                                            .originAddress(even ? savedC2.getBaseAddress() : savedC1.getBaseAddress())
-                                            .destinationAddress(Address.builder()
-                                                    .street("Rua Pedra Bonita")
-                                                    .number(String.valueOf(800 + i))
-                                                    .neighborhood("Barroca")
-                                                    .city("Belo Horizonte")
-                                                    .state("MG")
-                                                    .zipCode("30431-030")
-                                                    .build())
-                                            .routeDistanceKm(5.0 + (i % 7))
-                                            .amount(val)
-                                            .motoboyCommissionAmount(comm)
-                                            .status(st)
-                                            .createdAt(now.minus(25 - i, ChronoUnit.HOURS))
-                                            .collectedAt(st != OrderStatus.PENDENTE ? now.minus(24 - i, ChronoUnit.HOURS) : null)
-                                            .deliveredAt(st == OrderStatus.ENTREGUE ? now.minus(23 - i, ChronoUnit.HOURS) : null)
-                                            .updatedAt(now)
-                                            .build();
-                                })
-                                .toList();
+    private Order buildSampleOrder(int i, Client c1, Client c2, Motoboy m1, Motoboy m2, User master, Instant now) {
+        return Order.builder()
+                .orderNumber(1000L + i)
+                .clientId(i % 2 == 0 ? c2.getId() : c1.getId())
+                .motoboyId(i % 2 == 0 ? m2.getId() : m1.getId())
+                .requesterName(i % 2 == 0 ? "MARIANA" : "A. Junqueira")
+                .createdByUserId(master.getId())
+                .originAddress(i % 2 == 0 ? c2.getBaseAddress() : c1.getBaseAddress())
+                .destinationAddress(Address.builder()
+                        .street("Rua Pedra Bonita")
+                        .number(String.valueOf(800 + i))
+                        .neighborhood("Barroca")
+                        .city("Belo Horizonte")
+                        .state("MG")
+                        .zipCode("30431-030")
+                        .build())
+                .routeDistanceKm(5.0 + (i % 7))
+                .amount(i % 2 == 0 ? new BigDecimal("35.00") : new BigDecimal("25.00"))
+                .motoboyCommissionAmount(i % 2 == 0 ? new BigDecimal("28.00") : new BigDecimal("20.00"))
+                .status(resolveSampleStatus(i))
+                .createdAt(now.minus(25 - i, ChronoUnit.HOURS))
+                .collectedAt(resolveSampleStatus(i) != OrderStatus.PENDENTE ? now.minus(24 - i, ChronoUnit.HOURS) : null)
+                .deliveredAt(resolveSampleStatus(i) == OrderStatus.ENTREGUE ? now.minus(23 - i, ChronoUnit.HOURS) : null)
+                .updatedAt(now)
+                .build();
+    }
 
-                        return Flux.fromIterable(sampleOrders)
-                                .flatMap(orderRepository::save)
-                                .then();
-                    });
-                });
+    private OrderStatus resolveSampleStatus(int i) {
+        return i <= 8 ? OrderStatus.ENTREGUE : (i <= 15 ? OrderStatus.COLETADO : OrderStatus.PENDENTE);
     }
 }

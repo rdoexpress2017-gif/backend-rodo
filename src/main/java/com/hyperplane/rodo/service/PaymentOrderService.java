@@ -30,15 +30,14 @@ public class PaymentOrderService {
     private final ClientRepository clientRepository;
 
     public Flux<PaymentOrderResponseDTO> findAll(String clientId, PaymentOrderStatus status) {
-        final Flux<PaymentOrder> source = (clientId != null && !clientId.isBlank() && status != null)
+        return ((clientId != null && !clientId.isBlank() && status != null)
                 ? paymentOrderRepository.findByClientIdAndStatus(clientId, status)
                 : (clientId != null && !clientId.isBlank())
                 ? paymentOrderRepository.findByClientId(clientId)
                 : (status != null)
                 ? paymentOrderRepository.findByStatus(status)
-                : paymentOrderRepository.findAll();
-
-        return source.concatMap(this::enrichPaymentOrder);
+                : paymentOrderRepository.findAll())
+                .concatMap(this::enrichPaymentOrder);
     }
 
     public Mono<PaymentOrderResponseDTO> findById(String id) {
@@ -51,48 +50,45 @@ public class PaymentOrderService {
     public Mono<PaymentOrderResponseDTO> settle(String id) {
         return paymentOrderRepository.findById(id)
                 .switchIfEmpty(Mono.error(new ResourceNotFoundException("Ordem de Pagamento não encontrada: " + id)))
-                .flatMap(po -> {
-                    if (po.getStatus() == PaymentOrderStatus.PAGO) {
-                        return Mono.error(new BusinessRuleException("Esta Ordem de Pagamento já se encontra PAGA."));
-                    }
-                    final Instant now = Instant.now();
-                    final List<String> orderIds = po.getOrderIds() != null ? po.getOrderIds() : List.of();
-
-                    return orderRepository.findByIdIn(orderIds)
-                            .map(order -> order.toBuilder()
-                                    .status(OrderStatus.PAGO)
-                                    .paidAt(now)
-                                    .updatedAt(now)
-                                    .build())
-                            .flatMap(orderRepository::save)
-                            .then(Mono.defer(() -> paymentOrderRepository.save(
-                                    po.toBuilder()
-                                            .status(PaymentOrderStatus.PAGO)
-                                            .settledAt(now)
-                                            .updatedAt(now)
-                                            .build()
-                            )));
-                })
+                .flatMap(po -> po.getStatus() == PaymentOrderStatus.PAGO
+                        ? Mono.error(new BusinessRuleException("Esta Ordem de Pagamento já se encontra PAGA."))
+                        : settleOrdersAndPaymentOrder(po, Instant.now()))
                 .flatMap(this::enrichPaymentOrder);
     }
 
-    private Mono<PaymentOrderResponseDTO> enrichPaymentOrder(PaymentOrder po) {
-        final Mono<String> clientNameMono = po.getClientId() != null
-                ? clientRepository.findById(po.getClientId()).map(Client::getName).defaultIfEmpty("Cliente")
-                : Mono.just("-");
+    private Mono<PaymentOrder> settleOrdersAndPaymentOrder(PaymentOrder po, Instant settledAt) {
+        return orderRepository.findByIdIn(po.getOrderIds() != null ? po.getOrderIds() : List.of())
+                .map(order -> order.toBuilder()
+                        .status(OrderStatus.PAGO)
+                        .paidAt(settledAt)
+                        .updatedAt(settledAt)
+                        .build())
+                .flatMap(orderRepository::save)
+                .then(Mono.defer(() -> paymentOrderRepository.save(
+                        po.toBuilder()
+                                .status(PaymentOrderStatus.PAGO)
+                                .settledAt(settledAt)
+                                .updatedAt(settledAt)
+                                .build()
+                )));
+    }
 
-        return clientNameMono.map(clientName -> new PaymentOrderResponseDTO(
-                po.getId(),
-                po.getReportId(),
-                po.getClientId(),
-                clientName,
-                po.getOrderIds(),
-                po.getTotalAmount(),
-                po.getStatus(),
-                po.getIssueDate(),
-                po.getSettledAt(),
-                po.getCreatedAt(),
-                po.getUpdatedAt()
-        ));
+    private Mono<PaymentOrderResponseDTO> enrichPaymentOrder(PaymentOrder po) {
+        return (po.getClientId() != null
+                ? clientRepository.findById(po.getClientId()).map(Client::getName).defaultIfEmpty("Cliente")
+                : Mono.just("-"))
+                .map(clientName -> new PaymentOrderResponseDTO(
+                        po.getId(),
+                        po.getReportId(),
+                        po.getClientId(),
+                        clientName,
+                        po.getOrderIds(),
+                        po.getTotalAmount(),
+                        po.getStatus(),
+                        po.getIssueDate(),
+                        po.getSettledAt(),
+                        po.getCreatedAt(),
+                        po.getUpdatedAt()
+                ));
     }
 }

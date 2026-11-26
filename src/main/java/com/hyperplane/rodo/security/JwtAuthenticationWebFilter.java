@@ -11,6 +11,7 @@ import org.springframework.web.server.WebFilterChain;
 import reactor.core.publisher.Mono;
 
 import java.util.List;
+import java.util.Optional;
 
 @Component
 public class JwtAuthenticationWebFilter implements WebFilter {
@@ -24,24 +25,19 @@ public class JwtAuthenticationWebFilter implements WebFilter {
 
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
-        final String authHeader = exchange.getRequest().getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
-        if (authHeader == null || !authHeader.startsWith(BEARER_PREFIX)) {
-            return chain.filter(exchange);
-        }
-
-        final String token = authHeader.substring(BEARER_PREFIX.length());
-        return jwtTokenProvider.parseClaims(token)
-                .map(claims -> {
-                    final String userId = claims.getSubject();
-                    final String role = claims.get("role", String.class);
-                    final UsernamePasswordAuthenticationToken auth = new UsernamePasswordAuthenticationToken(
-                            userId,
-                            null,
-                            List.of(new SimpleGrantedAuthority(role))
-                    );
-                    return chain.filter(exchange)
-                            .contextWrite(ReactiveSecurityContextHolder.withAuthentication(auth));
-                })
-                .getOrElse(() -> chain.filter(exchange));
+        return Optional.ofNullable(exchange.getRequest().getHeaders().getFirst(HttpHeaders.AUTHORIZATION))
+                .filter(header -> header.startsWith(BEARER_PREFIX))
+                .map(header -> header.substring(BEARER_PREFIX.length()))
+                .map(token -> jwtTokenProvider.parseClaims(token)
+                        .map(claims -> chain.filter(exchange)
+                                .contextWrite(ReactiveSecurityContextHolder.withAuthentication(
+                                        new UsernamePasswordAuthenticationToken(
+                                                claims.getSubject(),
+                                                null,
+                                                List.of(new SimpleGrantedAuthority(claims.get("role", String.class)))
+                                        )
+                                )))
+                        .getOrElse(() -> chain.filter(exchange)))
+                .orElseGet(() -> chain.filter(exchange));
     }
 }

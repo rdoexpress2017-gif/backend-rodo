@@ -12,10 +12,12 @@ import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.math.BigDecimal;
 import java.text.NumberFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 @Service
 @Slf4j
@@ -27,76 +29,76 @@ public class EmailNotificationService {
     private final UserRepository userRepository;
 
     public Mono<String> sendDailyCompanyReportToMaster(ReportResponseDTO companyReport) {
-        final Flux<User> masterUsersFlux = Optional.ofNullable(userRepository)
+        return Optional.ofNullable(userRepository)
                 .map(UserRepository::findAll)
                 .orElse(Flux.empty())
                 .filter(user -> user != null
                         && user.isActive()
                         && user.getRole() == UserRole.MASTER
                         && user.getEmail() != null
-                        && !user.getEmail().isBlank());
-
-        return masterUsersFlux
+                        && !user.getEmail().isBlank())
                 .collectList()
-                .map(masters -> {
-                    final List<String> recipients = masters.isEmpty()
-                            ? List.of("admin@rodo.com")
-                            : masters.stream().map(User::getEmail).distinct().toList();
-
-                    final String emailSubject = String.format(
-                            "[RDO Express] Relatório Diário da Empresa (RESUMO GERAL) - %s",
-                            companyReport.reportCode()
-                    );
-                    final String emailBody = buildCompanyReportEmailBody(companyReport);
-
-                    recipients.forEach(recipient ->
-                            log.info(
-                                    "E-mail do Relatório Diário da Empresa ({}) enviado com sucesso para o usuário MASTER <{}>:\nAssunto: {}\n{}",
-                                    companyReport.reportCode(),
-                                    recipient,
-                                    emailSubject,
-                                    emailBody
-                            )
-                    );
-
-                    return String.join(", ", recipients);
-                });
+                .map(masters -> (masters.isEmpty()
+                        ? List.of("admin@rodo.com")
+                        : masters.stream().map(User::getEmail).distinct().toList())
+                        .stream()
+                        .peek(recipient -> log.info(
+                                "E-mail do Relatório Diário da Empresa ({}) enviado com sucesso para o usuário MASTER <{}>:\nAssunto: {}\n{}",
+                                companyReport.reportCode(),
+                                recipient,
+                                String.format("[RDO Express] Relatório Diário da Empresa (RESUMO GERAL) - %s", companyReport.reportCode()),
+                                buildCompanyReportEmailBody(companyReport)
+                        ))
+                        .collect(Collectors.joining(", ")));
     }
 
     public String buildCompanyReportEmailBody(ReportResponseDTO report) {
-        final NumberFormat fmt = NumberFormat.getCurrencyInstance(PT_BR);
-        final CompanyReportSummaryDTO s = report.companySummary();
-        if (s == null) {
-            return "Relatório da Empresa " + report.reportCode();
-        }
+        return Optional.ofNullable(report.companySummary())
+                .map(s -> String.join(
+                        "\n",
+                        "=== RESUMO GERAL (FINANCEIRO RDO) ===",
+                        String.format("• Receitas       : %s (Valor total de pedidos: %d)", formatCurrency(s.totalRevenue()), s.totalOrders()),
+                        String.format("• Já Recebido    : %s (%d pagos em caixa)", formatCurrency(s.paidRevenue()), s.paidOrdersCount()),
+                        String.format("• A Receber      : %s (%d a receber - não pagos)", formatCurrency(s.pendingRevenue()), s.pendingOrdersCount()),
+                        String.format("• Lucro (Pagos)  : %s (Somente sobre pedidos pagos)", formatCurrency(s.netProfit())),
+                        String.format("• Lucro Estimado : %s (Pedidos coletados/entregues/pagos - repasses - despesas)", formatCurrency(resolveEstimatedProfit(s))),
+                        String.format("• Repasses       : %s (Pagos: %s)", formatCurrency(s.totalCommissions()), formatCurrency(s.paidCommissions())),
+                        String.format("• Despesas       : %s (Lançamentos do período)", formatCurrency(s.totalExpenses())),
+                        String.format("• Colaborador    : %s (Comissão motoboys)", formatCurrency(s.collaboratorShare())),
+                        String.format("• Registros      : %d (%d pagos • %d pendentes)", s.totalOrders(), s.paidOrdersCount(), s.pendingOrdersCount()),
+                        "",
+                        "=== AGREGADO POR MOTOBOY (VALORES A PAGAR NO DIA) ===",
+                        formatMotoboyAggregates(s.motoboyAggregates()),
+                        String.format("=> VALOR FINAL DE TODOS OS MOTOBOYS JUNTOS NO DIA: %s", formatCurrency(s.totalMotoboysAmountToPay()))
+                ))
+                .orElseGet(() -> "Relatório da Empresa " + report.reportCode());
+    }
 
-        final StringBuilder sb = new StringBuilder();
-        sb.append("=== RESUMO GERAL (FINANCEIRO RDO) ===\n");
-        sb.append(String.format("• Receitas    : %s (Valor total de pedidos: %d)\n", fmt.format(s.totalRevenue()), s.totalOrders()));
-        sb.append(String.format("• Já Recebido : %s (%d pagos em caixa)\n", fmt.format(s.paidRevenue()), s.paidOrdersCount()));
-        sb.append(String.format("• A Receber   : %s (%d a receber - não pagos)\n", fmt.format(s.pendingRevenue()), s.pendingOrdersCount()));
-        sb.append(String.format("• Lucro       : %s (Somente sobre pedidos pagos)\n", fmt.format(s.netProfit()), s.paidOrdersCount()));
-        sb.append(String.format("• Repasses    : %s (Pagos: %s)\n", fmt.format(s.totalCommissions()), fmt.format(s.paidCommissions())));
-        sb.append(String.format("• Despesas    : %s (Lançamentos do período)\n", fmt.format(s.totalExpenses())));
-        sb.append(String.format("• Colaborador : %s (Comissão motoboys)\n", fmt.format(s.collaboratorShare())));
-        sb.append(String.format("• Registros   : %d (%d pagos • %d pendentes)\n\n", s.totalOrders(), s.paidOrdersCount(), s.pendingOrdersCount()));
+    private BigDecimal resolveEstimatedProfit(CompanyReportSummaryDTO s) {
+        return s.estimatedProfit() != null
+                ? s.estimatedProfit()
+                : (s.totalRevenue() != null && s.totalCommissions() != null && s.totalExpenses() != null
+                ? s.totalRevenue().subtract(s.totalCommissions()).subtract(s.totalExpenses())
+                : BigDecimal.ZERO);
+    }
 
-        sb.append("=== AGREGADO POR MOTOBOY (VALORES A PAGAR NO DIA) ===\n");
-        if (s.motoboyAggregates() != null) {
-            for (final MotoboyReportAggregateDTO agg : s.motoboyAggregates()) {
-                sb.append(String.format(
-                        "• %s (%s): %d pedidos | %.1f km | Bruto: %s | Valor a Pagar: %s\n",
+    private String formatMotoboyAggregates(List<MotoboyReportAggregateDTO> aggregates) {
+        return Optional.ofNullable(aggregates)
+                .orElse(List.of())
+                .stream()
+                .map(agg -> String.format(
+                        "• %s (%s): %d pedidos | %.1f km | Bruto: %s | Valor a Pagar: %s",
                         agg.motoboyName(),
                         agg.motoboyType(),
                         agg.totalOrders(),
                         agg.totalDistanceKm(),
-                        fmt.format(agg.grossAmount()),
-                        fmt.format(agg.amountToPay())
-                ));
-            }
-        }
-        sb.append(String.format("=> VALOR FINAL DE TODOS OS MOTOBOYS JUNTOS NO DIA: %s\n",
-                fmt.format(s.totalMotoboysAmountToPay())));
-        return sb.toString();
+                        formatCurrency(agg.grossAmount()),
+                        formatCurrency(agg.amountToPay())
+                ))
+                .collect(Collectors.joining("\n"));
+    }
+
+    private String formatCurrency(BigDecimal value) {
+        return NumberFormat.getCurrencyInstance(PT_BR).format(value != null ? value : BigDecimal.ZERO);
     }
 }
