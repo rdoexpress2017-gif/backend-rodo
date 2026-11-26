@@ -59,4 +59,10 @@ public class ClientService {
                 .flatMap(clientRepository::save)
                 .map(clientMapper::toResponseDTO);
     }
+
+    public Mono<Void> delete(String id) {
+        return clientRepository.findById(id)
+                .switchIfEmpty(Mono.error(new ResourceNotFoundException("Cliente não encontrado: " + id)))
+                .flatMap(clientRepository::delete);
+    }
 }

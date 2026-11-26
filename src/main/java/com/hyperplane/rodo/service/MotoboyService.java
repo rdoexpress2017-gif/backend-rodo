@@ -57,4 +57,10 @@ public class MotoboyService {
                 .flatMap(motoboyRepository::save)
                 .map(motoboyMapper::toResponseDTO);
     }
+
+    public Mono<Void> delete(String id) {
+        return motoboyRepository.findById(id)
+                .switchIfEmpty(Mono.error(new ResourceNotFoundException("Motoboy não encontrado: " + id)))
+                .flatMap(motoboyRepository::delete);
+    }
 }
