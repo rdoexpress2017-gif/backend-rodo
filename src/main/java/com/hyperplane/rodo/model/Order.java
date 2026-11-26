@@ -43,6 +43,7 @@ public class Order {
     @Indexed
     @Field("payment_order_id")
     String paymentOrderId;
+    @Indexed(name = "idx_orders_created_at_ttl", expireAfterSeconds = 15552000)
     @Field("created_at")
     Instant createdAt;
     @Field("collected_at")

@@ -19,4 +19,5 @@ public interface OrderRepository extends ReactiveMongoRepository<Order, String> 
     Flux<Order> findByPaymentOrderId(String paymentOrderId);
     Flux<Order> findByIdIn(Collection<String> ids);
     Mono<Order> findTopByOrderByOrderNumberDesc();
+    Mono<Long> deleteByCreatedAtBefore(Instant cutoff);
 }

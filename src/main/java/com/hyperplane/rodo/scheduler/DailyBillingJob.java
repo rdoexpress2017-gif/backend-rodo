@@ -1,5 +1,6 @@
 package com.hyperplane.rodo.scheduler;
 
+import com.hyperplane.rodo.service.OrderService;
 import com.hyperplane.rodo.service.ReportService;
 import com.hyperplane.rodo.service.SettingsService;
 import lombok.RequiredArgsConstructor;
@@ -7,6 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.ZoneId;
@@ -21,13 +23,18 @@ public class DailyBillingJob {
     private static final DateTimeFormatter HH_MM_FMT = DateTimeFormatter.ofPattern("HH:mm");
 
     private final ReportService reportService;
+    private final OrderService orderService;
     private final SettingsService settingsService;
 
     @Scheduled(cron = "0 0 0 * * *", zone = "America/Sao_Paulo")
     public void resetDailyExecutionFlagAtMidnight() {
-        log.info("Resetando flag daily_job_executed_today à meia-noite (00:00).");
+        log.info("Resetando flag daily_job_executed_today e executando expurgo TTL (6 meses) à meia-noite (00:00).");
         settingsService.resetDailyJobExecutedFlag()
-                .doOnError(err -> log.error("Erro ao resetar flag diária à meia-noite: {}", err.getMessage(), err))
+                .then(orderService.purgeExpiredOrders(Instant.now()))
+                .doOnNext(deletedOrders -> log.info("TTL (6 meses) executado para pedidos: {} removidos.", deletedOrders))
+                .then(reportService.purgeExpiredReports(Instant.now()))
+                .doOnNext(deletedReports -> log.info("TTL (6 meses) executado para relatórios: {} removidos.", deletedReports))
+                .doOnError(err -> log.error("Erro na rotina de meia-noite (flag diária / TTL 6 meses): {}", err.getMessage(), err))
                 .subscribe();
     }
 

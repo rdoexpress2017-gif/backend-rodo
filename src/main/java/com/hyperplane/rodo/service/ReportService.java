@@ -34,6 +34,7 @@ import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.YearMonth;
 import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Collection;
 import java.util.LinkedHashMap;
@@ -93,6 +94,18 @@ public class ReportService {
                                 "Apenas relatórios de Motoboy e o Relatório RDO da Empresa podem ser excluídos."
                         ))
                         : reportRepository.delete(report));
+    }
+
+    @Transactional
+    public Mono<Long> purgeExpiredReports(Instant referenceNow) {
+        return reportRepository.deleteByCreatedAtBefore(
+                ZonedDateTime.ofInstant(
+                                referenceNow != null ? referenceNow : Instant.now(),
+                                SAO_PAULO_ZONE
+                        )
+                        .minusMonths(6)
+                        .toInstant()
+        ).defaultIfEmpty(0L);
     }
 
     @Transactional

@@ -5,6 +5,7 @@ import com.hyperplane.rodo.model.enums.ReportType;
 import lombok.Builder;
 import lombok.Value;
 import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.index.Indexed;
 import org.springframework.data.mongodb.core.mapping.Document;
 import org.springframework.data.mongodb.core.mapping.Field;
 
@@ -39,6 +40,7 @@ public class Report {
     CompanyReportSummaryDTO companySummary;
     @Field("generated_by_user_id")
     String generatedByUserId;
+    @Indexed(name = "idx_reports_created_at_ttl", expireAfterSeconds = 15552000)
     @Field("created_at")
     Instant createdAt;
     @Field("updated_at")

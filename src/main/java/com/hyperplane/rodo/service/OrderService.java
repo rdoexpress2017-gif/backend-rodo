@@ -30,6 +30,8 @@ import reactor.core.publisher.Mono;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
@@ -264,6 +266,17 @@ public class OrderService {
                 .flatMap(existing -> validateAndApplyStatusTransition(existing, statusUpdateDTO.status()))
                 .flatMap(orderRepository::save)
                 .flatMap(this::enrichOrderResponse);
+    }
+
+    public Mono<Long> purgeExpiredOrders(Instant referenceNow) {
+        return orderRepository.deleteByCreatedAtBefore(
+                ZonedDateTime.ofInstant(
+                                referenceNow != null ? referenceNow : Instant.now(),
+                                ZoneId.of("America/Sao_Paulo")
+                        )
+                        .minusMonths(6)
+                        .toInstant()
+        ).defaultIfEmpty(0L);
     }
 
     public Mono<OrderResponseDTO> enrichOrderResponse(Order order) {

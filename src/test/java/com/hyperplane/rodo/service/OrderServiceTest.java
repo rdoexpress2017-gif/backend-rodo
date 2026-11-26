@@ -342,4 +342,26 @@ class OrderServiceTest {
                 )
                 .verifyComplete();
     }
+
+    @Test
+    @DisplayName("Should configure 6-month TTL index (15552000 seconds) on Order.createdAt and delete orders older than 6 months")
+    void shouldEnforceSixMonthTtlPolicyOnOrders() throws Exception {
+        final org.springframework.data.mongodb.core.index.Indexed ttlIndex =
+                Order.class.getDeclaredField("createdAt")
+                        .getAnnotation(org.springframework.data.mongodb.core.index.Indexed.class);
+        org.junit.jupiter.api.Assertions.assertNotNull(ttlIndex);
+        org.junit.jupiter.api.Assertions.assertEquals(15552000, ttlIndex.expireAfterSeconds());
+
+        final Instant referenceNow = Instant.parse("2026-11-26T23:00:00Z");
+        final Instant expectedCutoff = java.time.ZonedDateTime
+                .ofInstant(referenceNow, java.time.ZoneId.of("America/Sao_Paulo"))
+                .minusMonths(6)
+                .toInstant();
+
+        when(orderRepository.deleteByCreatedAtBefore(expectedCutoff)).thenReturn(Mono.just(5L));
+
+        StepVerifier.create(orderService.purgeExpiredOrders(referenceNow))
+                .expectNext(5L)
+                .verifyComplete();
+    }
 }
